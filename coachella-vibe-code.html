@@ -898,7 +898,8 @@ async function exchangeCode(code) {
 // ═══════════════════════════════════════════
 // SPOTIFY API HELPERS
 // ═══════════════════════════════════════════
-async function spotifyFetch(endpoint, options = {}) {
+const SPOTIFY_RETRY_MAX = 3;
+async function spotifyFetch(endpoint, options = {}, retriesLeft = SPOTIFY_RETRY_MAX) {
   const url = endpoint.startsWith('http') ? endpoint : `https://api.spotify.com/v1${endpoint}`;
   const res = await fetch(url, {
     ...options,
@@ -915,6 +916,13 @@ async function spotifyFetch(endpoint, options = {}) {
     return null;
   }
   if (res.status === 204 || res.status === 202) return {};
+  // Retry on rate limit (429) or quota/forbidden (403) with backoff
+  if ((res.status === 403 || res.status === 429) && retriesLeft > 0) {
+    const retrySec = res.headers.get('Retry-After');
+    const waitMs = retrySec ? Math.min(parseInt(retrySec, 10) * 1000, 15000) : Math.min(2000 * Math.pow(2, SPOTIFY_RETRY_MAX - retriesLeft), 12000);
+    await sleep(waitMs);
+    return spotifyFetch(endpoint, options, retriesLeft - 1);
+  }
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
     console.error('Spotify API error:', res.status, err);
@@ -980,6 +988,7 @@ async function loadArtistTracks() {
     if (!searchRes || !searchRes.artists || !searchRes.artists.items.length) {
       console.warn(`Couldn't find: ${name}`);
       loaded++;
+      await sleep(450);
       continue;
     }
 
@@ -992,6 +1001,7 @@ async function loadArtistTracks() {
     if (!topRes || !topRes.tracks || topRes.tracks.length === 0) {
       console.warn(`No tracks for: ${name}`);
       loaded++;
+      await sleep(450);
       continue;
     }
 
@@ -1015,11 +1025,8 @@ async function loadArtistTracks() {
     };
 
     loaded++;
-
-    // Small delay to avoid rate limits
-    if (loaded % 5 === 0) {
-      await sleep(300);
-    }
+    // Delay after every artist to stay under Spotify rate limits (403/429)
+    await sleep(450);
   }
 
   buildQueue();
