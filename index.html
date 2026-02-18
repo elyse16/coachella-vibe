@@ -774,6 +774,7 @@
 <!-- Toast -->
 <div class="toast" id="toast"></div>
 
+<script src="https://sdk.scdn.co/spotify-player.js"></script>
 <script>
 // ═══════════════════════════════════════════
 // CONFIG
@@ -983,10 +984,14 @@ async function initApp() {
   updateStats();
   renderLeaderboards();
   checkFinishEligibility();
-  hideLoading();
 
-  // Wait for an active device
-  await ensureDevice();
+  // Start in-browser Spotify player
+  showLoading('Starting Spotify player...');
+  const playerReady = await initWebPlayer();
+  if (!playerReady) {
+    await ensureDevice();
+  }
+  hideLoading();
 
   // Play first song
   playNext();
@@ -1067,18 +1072,66 @@ function buildQueue() {
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 // ═══════════════════════════════════════════
+// WEB PLAYBACK SDK (in-browser player)
+// ═══════════════════════════════════════════
+let spotifyPlayer = null;
+let sdkReady = false;
+
+window.onSpotifyWebPlaybackSDKReady = () => { sdkReady = true; };
+
+function initWebPlayer() {
+  return new Promise((resolve) => {
+    function tryInit() {
+      if (!sdkReady) { setTimeout(tryInit, 200); return; }
+      spotifyPlayer = new Spotify.Player({
+        name: 'Coachella Vibe',
+        getOAuthToken: cb => cb(accessToken),
+        volume: 0.8
+      });
+      spotifyPlayer.addListener('ready', ({ device_id }) => {
+        deviceId = device_id;
+        console.log('Web player ready, device:', device_id);
+        resolve(true);
+      });
+      spotifyPlayer.addListener('not_ready', () => {
+        console.warn('Web player went offline');
+      });
+      spotifyPlayer.addListener('initialization_error', ({ message }) => {
+        console.error('SDK init error:', message);
+        resolve(false);
+      });
+      spotifyPlayer.addListener('authentication_error', ({ message }) => {
+        console.error('SDK auth error:', message);
+        resolve(false);
+      });
+      spotifyPlayer.addListener('playback_error', ({ message }) => {
+        console.error('SDK playback error:', message);
+      });
+      spotifyPlayer.addListener('player_state_changed', (state) => {
+        if (!state) return;
+        isPlaying = !state.paused;
+        updatePlayPauseIcon();
+      });
+      spotifyPlayer.connect();
+    }
+    tryInit();
+  });
+}
+
+// ═══════════════════════════════════════════
 // DEVICE MANAGEMENT
 // ═══════════════════════════════════════════
 async function ensureDevice() {
+  if (deviceId) return true;
+  // Fallback: check for external devices
   const devRes = await spotifyFetch('/me/player/devices');
-  if (!devRes || !devRes.devices || devRes.devices.length === 0) {
-    showError('No active Spotify device found! Open Spotify on your phone, desktop, or browser and start playing any song, then come back here.');
-    return false;
+  if (devRes && devRes.devices && devRes.devices.length > 0) {
+    const active = devRes.devices.find(d => d.is_active);
+    deviceId = active ? active.id : devRes.devices[0].id;
+    return true;
   }
-  // Prefer active device
-  const active = devRes.devices.find(d => d.is_active);
-  deviceId = active ? active.id : devRes.devices[0].id;
-  return true;
+  showError('No playback device available. Please make sure you have Spotify Premium and allow audio in your browser.');
+  return false;
 }
 
 // ═══════════════════════════════════════════
@@ -1137,14 +1190,17 @@ function updateNowPlaying() {
 }
 
 async function togglePlayPause() {
-  if (isPlaying) {
+  if (spotifyPlayer) {
+    await spotifyPlayer.togglePlay();
+  } else if (isPlaying) {
     await spotifyFetch('/me/player/pause', { method: 'PUT' });
     isPlaying = false;
+    updatePlayPauseIcon();
   } else {
     await spotifyFetch('/me/player/play', { method: 'PUT' });
     isPlaying = true;
+    updatePlayPauseIcon();
   }
-  updatePlayPauseIcon();
 }
 
 function updatePlayPauseIcon() {
