@@ -628,6 +628,129 @@
 
   .error-msg.show { display: block; }
 
+  /* ── COMMUNITY TAB ── */
+  .community-artist-row {
+    display: flex;
+    align-items: center;
+    padding: 12px 16px;
+    border-radius: 12px;
+    background: var(--glass);
+    border: 1px solid var(--glass-border);
+    gap: 14px;
+    margin-bottom: 6px;
+  }
+
+  .community-raters {
+    font-size: 0.75rem;
+    color: rgba(255,255,255,0.4);
+    margin-top: 4px;
+  }
+
+  .community-raters span {
+    cursor: pointer;
+    transition: color 0.2s;
+  }
+
+  .community-raters span:hover {
+    color: var(--desert-gold);
+    text-decoration: underline;
+  }
+
+  .user-detail-header {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 20px;
+    background: var(--glass);
+    border: 1px solid var(--glass-border);
+    border-radius: 16px;
+    margin-bottom: 16px;
+  }
+
+  .user-detail-avatar {
+    width: 48px;
+    height: 48px;
+    border-radius: 50%;
+    background: rgba(255,255,255,0.1);
+    overflow: hidden;
+    flex-shrink: 0;
+  }
+
+  .user-detail-avatar img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+  }
+
+  .user-detail-name {
+    font-weight: 700;
+    font-size: 1.1rem;
+  }
+
+  .user-detail-meta {
+    font-size: 0.8rem;
+    color: rgba(255,255,255,0.4);
+    margin-top: 2px;
+  }
+
+  .back-btn {
+    background: none;
+    border: 1px solid rgba(255,255,255,0.15);
+    color: rgba(255,255,255,0.5);
+    border-radius: 8px;
+    padding: 6px 14px;
+    font-family: 'DM Sans', sans-serif;
+    font-size: 0.8rem;
+    cursor: pointer;
+    margin-left: auto;
+    transition: all 0.2s;
+  }
+
+  .back-btn:hover {
+    border-color: rgba(255,255,255,0.3);
+    color: #fff;
+  }
+
+  .top-raters {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 20px;
+  }
+
+  .rater-chip {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: var(--glass);
+    border: 1px solid var(--glass-border);
+    border-radius: 10px;
+    padding: 8px 14px;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+
+  .rater-chip:hover {
+    border-color: var(--desert-gold);
+    background: rgba(247,197,72,0.08);
+  }
+
+  .rater-chip img {
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+  }
+
+  .rater-chip .rater-name {
+    font-size: 0.85rem;
+    font-weight: 600;
+  }
+
+  .rater-chip .rater-count {
+    font-size: 0.75rem;
+    color: rgba(255,255,255,0.4);
+  }
+
   /* ── RESPONSIVE ── */
   @media (max-width: 600px) {
     .container { padding: 12px; }
@@ -726,6 +849,7 @@
       <button class="tab-btn active" onclick="switchTab('active')">Active</button>
       <button class="tab-btn" onclick="switchTab('eliminated')">Eliminated</button>
       <button class="tab-btn" onclick="switchTab('all')">All Artists</button>
+      <button class="tab-btn" onclick="switchTab('community')">Community</button>
     </div>
 
     <div id="tab-active" class="tab-content active">
@@ -736,6 +860,9 @@
     </div>
     <div id="tab-all" class="tab-content">
       <div class="leaderboard" id="leaderboard-all"></div>
+    </div>
+    <div id="tab-community" class="tab-content">
+      <div id="community-content"></div>
     </div>
 
     <!-- Finish -->
@@ -774,8 +901,24 @@
 <!-- Toast -->
 <div class="toast" id="toast"></div>
 
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore-compat.js"></script>
 <script src="https://sdk.scdn.co/spotify-player.js"></script>
 <script>
+// ═══════════════════════════════════════════
+// FIREBASE CONFIG
+// ═══════════════════════════════════════════
+const firebaseConfig = {
+  apiKey: "AIzaSyB27zf7Co9WpyB8FgmWYfIvwwGZiss_3QI",
+  authDomain: "coachella-vibes.firebaseapp.com",
+  projectId: "coachella-vibes",
+  storageBucket: "coachella-vibes.firebasestorage.app",
+  messagingSenderId: "736899142333",
+  appId: "1:736899142333:web:9bb61b3b83e12a494c1dd4"
+};
+firebase.initializeApp(firebaseConfig);
+const db = firebase.firestore();
+
 // ═══════════════════════════════════════════
 // CONFIG
 // ═══════════════════════════════════════════
@@ -844,12 +987,74 @@ const COACHELLA_ARTISTS = [
 // ═══════════════════════════════════════════
 let accessToken = null;
 let userId = null;
+let userDisplayName = null;
+let userAvatar = null;
 let artists = {}; // { name: { tracks: [], ratings: [], eliminated: false, avgRating: 0 } }
 let songQueue = []; // shuffled array of { artist, track }
 let currentSong = null;
 let isPlaying = false;
 let totalRated = 0;
 let deviceId = null;
+
+// ═══════════════════════════════════════════
+// FIRESTORE HELPERS
+// ═══════════════════════════════════════════
+async function fbUpsertUser(spotifyId, displayName, avatarUrl) {
+  try {
+    await db.collection('users').doc(spotifyId).set({
+      display_name: displayName || 'Unknown',
+      avatar_url: avatarUrl || '',
+      last_seen: firebase.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
+  } catch (e) { console.warn('Firebase user upsert failed:', e); }
+}
+
+async function fbSaveRating(spotifyId, artistName, trackId, trackName, score) {
+  try {
+    const docId = `${spotifyId}_${trackId}`;
+    await db.collection('ratings').doc(docId).set({
+      spotify_id: spotifyId,
+      artist_name: artistName,
+      track_id: trackId,
+      track_name: trackName,
+      score: score,
+      created_at: firebase.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
+  } catch (e) { console.warn('Firebase rating save failed:', e); }
+}
+
+async function fbLoadUserRatings(spotifyId) {
+  try {
+    const snap = await db.collection('ratings')
+      .where('spotify_id', '==', spotifyId).get();
+    return snap.docs.map(d => d.data());
+  } catch (e) {
+    console.warn('Firebase load ratings failed:', e);
+    return [];
+  }
+}
+
+async function fbLoadAllRatings() {
+  try {
+    const snap = await db.collection('ratings').get();
+    return snap.docs.map(d => d.data());
+  } catch (e) {
+    console.warn('Firebase load all ratings failed:', e);
+    return [];
+  }
+}
+
+async function fbLoadAllUsers() {
+  try {
+    const snap = await db.collection('users').get();
+    const users = {};
+    snap.docs.forEach(d => { users[d.id] = d.data(); });
+    return users;
+  } catch (e) {
+    console.warn('Firebase load users failed:', e);
+    return {};
+  }
+}
 
 // ═══════════════════════════════════════════
 // AUTH
@@ -960,10 +1165,15 @@ async function initApp() {
   document.getElementById('login-screen').style.display = 'none';
   document.getElementById('player-section').style.display = 'block';
 
-  // Get user ID
+  // Get user ID and profile
   const me = await spotifyFetch('/me');
   if (!me) { hideLoading(); return; }
   userId = me.id;
+  userDisplayName = me.display_name || me.id;
+  userAvatar = (me.images && me.images.length > 0) ? me.images[0].url : '';
+
+  // Upsert to Firebase (fire-and-forget)
+  fbUpsertUser(userId, userDisplayName, userAvatar);
 
   // Start in-browser Spotify player
   showLoading('Starting Spotify player...');
@@ -972,7 +1182,40 @@ async function initApp() {
     await ensureDevice();
   }
 
-  // Check for saved session
+  // Try restoring from Firebase first, then local storage fallback
+  showLoading('Restoring your ratings...');
+  const savedRatings = await fbLoadUserRatings(userId);
+  if (savedRatings && savedRatings.length > 0) {
+    // Rebuild artist state from Firebase ratings
+    const ratingsByArtist = {};
+    for (const r of savedRatings) {
+      if (!ratingsByArtist[r.artist_name]) ratingsByArtist[r.artist_name] = [];
+      ratingsByArtist[r.artist_name].push(r);
+    }
+    for (const [name, ratings] of Object.entries(ratingsByArtist)) {
+      if (!artists[name]) {
+        artists[name] = { spotifyId: '', tracks: [], ratings: [], eliminated: false, avgRating: 0 };
+      }
+      artists[name].ratings = ratings.map(r => ({
+        trackId: r.track_id,
+        trackName: r.track_name,
+        score: r.score
+      }));
+      const avg = ratings.reduce((a, r) => a + r.score, 0) / ratings.length;
+      artists[name].avgRating = Math.round(avg * 10) / 10;
+      if (avg < 3) artists[name].eliminated = true;
+    }
+    totalRated = savedRatings.length;
+    updateStats();
+    renderLeaderboards();
+    checkFinishEligibility();
+    hideLoading();
+    // Still load tracks in background for playback
+    loadArtistTracksInBackground();
+    return;
+  }
+
+  // Local storage fallback
   const saved = localStorage.getItem('vibe_session');
   if (saved) {
     try {
@@ -999,7 +1242,6 @@ async function initApp() {
 
 async function loadArtistTracksInBackground() {
   loadingInBackground = true;
-  artists = {};
   let loaded = 0;
   let firstSongPlayed = false;
 
@@ -1007,7 +1249,6 @@ async function loadArtistTracksInBackground() {
     document.getElementById('progress-fill').style.width =
       ((loaded / COACHELLA_ARTISTS.length) * 100) + '%';
 
-    // Search for tracks by this artist (top-tracks endpoint removed in Feb 2026 dev mode)
     const searchRes = await spotifyFetch(
       `/search?q=${encodeURIComponent('artist:' + name)}&type=track&limit=10`
     );
@@ -1027,15 +1268,16 @@ async function loadArtistTracksInBackground() {
       duration_ms: t.duration_ms
     }));
 
-    // Get the artist's Spotify ID from the first track result
     const firstArtist = searchRes.tracks.items[0]?.artists?.[0];
 
+    // Merge with existing data (preserves Firebase-restored ratings)
+    const existing = artists[name] || { ratings: [], eliminated: false, avgRating: 0 };
     artists[name] = {
       spotifyId: firstArtist?.id || '',
       tracks: tracks,
-      ratings: [],
-      eliminated: false,
-      avgRating: 0
+      ratings: existing.ratings,
+      eliminated: existing.eliminated,
+      avgRating: existing.avgRating
     };
 
     for (const track of tracks) {
@@ -1245,14 +1487,20 @@ function rate(score) {
   });
 
   // Record rating
-  artistData.ratings.push({
+  const ratingObj = {
     trackId: currentSong.track.id,
     trackName: currentSong.track.name,
     score: score
-  });
+  };
+  artistData.ratings.push(ratingObj);
+
+  // Persist to Firebase (fire-and-forget)
+  if (userId) {
+    fbSaveRating(userId, artistName, ratingObj.trackId, ratingObj.trackName, score);
+  }
 
   // Recalculate average
-  const sum = artistData.ratings.reduce((a, r) => a + r.score, 0);
+  const sum = artistData.ratings.reduce((a, r) => a + (typeof r === 'number' ? r : r.score), 0);
   artistData.avgRating = sum / artistData.ratings.length;
 
   totalRated++;
@@ -1349,6 +1597,150 @@ function switchTab(tab) {
 
   event.target.classList.add('active');
   document.getElementById(`tab-${tab}`).classList.add('active');
+
+  if (tab === 'community') loadCommunityTab();
+}
+
+// ═══════════════════════════════════════════
+// COMMUNITY TAB
+// ═══════════════════════════════════════════
+async function loadCommunityTab() {
+  const container = document.getElementById('community-content');
+  container.innerHTML = '<div style="text-align:center;padding:30px;color:rgba(255,255,255,0.4)">Loading community ratings...</div>';
+
+  const [allRatings, allUsers] = await Promise.all([fbLoadAllRatings(), fbLoadAllUsers()]);
+
+  if (!allRatings.length) {
+    container.innerHTML = '<div style="text-align:center;padding:30px;color:rgba(255,255,255,0.4)">No community ratings yet. Be the first!</div>';
+    return;
+  }
+
+  // Build global artist averages + per-user data
+  const artistMap = {}; // { artistName: { scores: [], raters: Set } }
+  const userMap = {};   // { spotifyId: { ratings: [], ... } }
+
+  for (const r of allRatings) {
+    if (!artistMap[r.artist_name]) artistMap[r.artist_name] = { scores: [], raters: new Set() };
+    artistMap[r.artist_name].scores.push(r.score);
+    artistMap[r.artist_name].raters.add(r.spotify_id);
+
+    if (!userMap[r.spotify_id]) userMap[r.spotify_id] = { count: 0 };
+    userMap[r.spotify_id].count++;
+  }
+
+  // Sort artists by average rating descending
+  const sorted = Object.entries(artistMap)
+    .map(([name, data]) => ({
+      name,
+      avg: data.scores.reduce((a, b) => a + b, 0) / data.scores.length,
+      count: data.scores.length,
+      raters: [...data.raters]
+    }))
+    .sort((a, b) => b.avg - a.avg);
+
+  // Top raters section
+  const topRaters = Object.entries(userMap)
+    .map(([id, data]) => ({ id, count: data.count, ...allUsers[id] }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 10);
+
+  let html = '<div style="margin-bottom:16px"><h3 style="font-size:0.9rem;color:rgba(255,255,255,0.5);margin-bottom:10px;font-weight:600">TOP RATERS</h3><div class="top-raters">';
+
+  for (const rater of topRaters) {
+    const name = rater.display_name || rater.id;
+    const avatar = rater.avatar_url || '';
+    html += `<div class="rater-chip" onclick="showUserDetail('${rater.id}')">`;
+    if (avatar) html += `<img src="${avatar}" alt="">`;
+    else html += `<div style="width:28px;height:28px;border-radius:50%;background:rgba(255,255,255,0.1)"></div>`;
+    html += `<div><div class="rater-name">${name}</div><div class="rater-count">${rater.count} ratings</div></div></div>`;
+  }
+
+  html += '</div></div>';
+  html += '<h3 style="font-size:0.9rem;color:rgba(255,255,255,0.5);margin-bottom:10px;font-weight:600">GLOBAL ARTIST RANKINGS</h3>';
+
+  for (let i = 0; i < sorted.length; i++) {
+    const a = sorted[i];
+    const stars = '★'.repeat(Math.round(a.avg)) + '☆'.repeat(5 - Math.round(a.avg));
+    const raterNames = a.raters.map(id => {
+      const u = allUsers[id];
+      const n = u ? u.display_name : id.slice(0, 8);
+      return `<span onclick="showUserDetail('${id}')">${n}</span>`;
+    }).join(', ');
+
+    html += `<div class="community-artist-row">
+      <div style="font-size:0.75rem;color:rgba(255,255,255,0.3);width:24px;text-align:center">${i + 1}</div>
+      <div style="flex:1">
+        <div style="font-weight:600;font-size:0.95rem">${a.name}</div>
+        <div class="community-raters">Rated by: ${raterNames}</div>
+      </div>
+      <div style="text-align:right">
+        <div style="font-size:0.9rem;color:var(--desert-gold)">${stars}</div>
+        <div style="font-size:0.8rem;color:rgba(255,255,255,0.5)">${a.avg.toFixed(1)} · ${a.count} ratings</div>
+      </div>
+    </div>`;
+  }
+
+  container.innerHTML = html;
+}
+
+async function showUserDetail(spotifyId) {
+  const container = document.getElementById('community-content');
+  container.innerHTML = '<div style="text-align:center;padding:30px;color:rgba(255,255,255,0.4)">Loading...</div>';
+
+  const [allRatings, allUsers] = await Promise.all([fbLoadAllRatings(), fbLoadAllUsers()]);
+  const user = allUsers[spotifyId] || {};
+  const userRatings = allRatings.filter(r => r.spotify_id === spotifyId);
+
+  if (!userRatings.length) {
+    container.innerHTML = `<button class="back-btn" onclick="loadCommunityTab()" style="margin-bottom:12px">← Back</button>
+      <div style="text-align:center;padding:30px;color:rgba(255,255,255,0.4)">No ratings from this user yet.</div>`;
+    return;
+  }
+
+  // Group by artist
+  const byArtist = {};
+  for (const r of userRatings) {
+    if (!byArtist[r.artist_name]) byArtist[r.artist_name] = [];
+    byArtist[r.artist_name].push(r);
+  }
+
+  const sorted = Object.entries(byArtist)
+    .map(([name, ratings]) => ({
+      name,
+      avg: ratings.reduce((a, r) => a + r.score, 0) / ratings.length,
+      count: ratings.length
+    }))
+    .sort((a, b) => b.avg - a.avg);
+
+  const displayName = user.display_name || spotifyId;
+  const avatar = user.avatar_url || '';
+  const isMe = spotifyId === userId;
+
+  let html = `<div class="user-detail-header">`;
+  html += `<div class="user-detail-avatar">`;
+  if (avatar) html += `<img src="${avatar}" alt="">`;
+  html += `</div>`;
+  html += `<div>
+    <div class="user-detail-name">${displayName}${isMe ? ' (you)' : ''}</div>
+    <div class="user-detail-meta">${userRatings.length} ratings · ${sorted.length} artists</div>
+  </div>`;
+  html += `<button class="back-btn" onclick="loadCommunityTab()">← Back</button>`;
+  html += `</div>`;
+
+  for (let i = 0; i < sorted.length; i++) {
+    const a = sorted[i];
+    const stars = '★'.repeat(Math.round(a.avg)) + '☆'.repeat(5 - Math.round(a.avg));
+    html += `<div class="community-artist-row">
+      <div style="font-size:0.75rem;color:rgba(255,255,255,0.3);width:24px;text-align:center">${i + 1}</div>
+      <div style="flex:1;font-weight:600;font-size:0.95rem">${a.name}</div>
+      <div style="text-align:right">
+        <div style="font-size:0.9rem;color:var(--desert-gold)">${stars}</div>
+        <div style="font-size:0.8rem;color:rgba(255,255,255,0.5)">${a.avg.toFixed(1)} · ${a.count} tracks</div>
+      </div>
+    </div>`;
+  }
+
+  container.innerHTML = html;
 }
 
 function checkFinishEligibility() {
