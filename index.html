@@ -952,8 +952,10 @@ async function spotifyFetch(endpoint, options = {}, retriesLeft = SPOTIFY_RETRY_
 // ═══════════════════════════════════════════
 // INIT
 // ═══════════════════════════════════════════
+let loadingInBackground = false;
+
 async function initApp() {
-  showLoading('Setting up your Coachella experience...');
+  showLoading('Connecting to Spotify...');
   document.getElementById('login-screen').style.display = 'none';
   document.getElementById('player-section').style.display = 'block';
 
@@ -961,6 +963,13 @@ async function initApp() {
   const me = await spotifyFetch('/me');
   if (!me) { hideLoading(); return; }
   userId = me.id;
+
+  // Start in-browser Spotify player
+  showLoading('Starting Spotify player...');
+  const playerReady = await initWebPlayer();
+  if (!playerReady) {
+    await ensureDevice();
+  }
 
   // Check for saved session
   const saved = localStorage.getItem('vibe_session');
@@ -970,42 +979,34 @@ async function initApp() {
       artists = session.artists;
       totalRated = session.totalRated;
       songQueue = session.songQueue || [];
-      // Rebuild queue if empty
-      if (songQueue.length === 0) {
-        buildQueue();
-      }
+      if (songQueue.length === 0) buildQueue();
+      updateStats();
+      renderLeaderboards();
+      checkFinishEligibility();
+      hideLoading();
+      playNext();
+      return;
     } catch(e) {
       console.log('Could not restore session, starting fresh');
-      await loadArtistTracks();
     }
-  } else {
-    await loadArtistTracks();
   }
 
-  updateStats();
-  renderLeaderboards();
-  checkFinishEligibility();
-
-  // Start in-browser Spotify player
-  showLoading('Starting Spotify player...');
-  const playerReady = await initWebPlayer();
-  if (!playerReady) {
-    await ensureDevice();
-  }
+  // No saved session: start loading artists in the background
   hideLoading();
-
-  // Play first song
-  playNext();
+  loadArtistTracksInBackground();
 }
 
-async function loadArtistTracks() {
+async function loadArtistTracksInBackground() {
+  loadingInBackground = true;
   artists = {};
   let loaded = 0;
+  let firstSongPlayed = false;
 
   for (const name of COACHELLA_ARTISTS) {
-    showLoading(`Fetching tracks: ${name} (${loaded + 1}/${COACHELLA_ARTISTS.length})`);
+    // Update progress in the stats area instead of blocking overlay
+    document.getElementById('progress-fill').style.width =
+      ((loaded / COACHELLA_ARTISTS.length) * 100) + '%';
 
-    // Search for artist
     const searchRes = await spotifyFetch(`/search?q=${encodeURIComponent(name)}&type=artist&limit=3`);
     if (!searchRes || !searchRes.artists || !searchRes.artists.items.length) {
       console.warn(`Couldn't find: ${name}`);
@@ -1014,11 +1015,9 @@ async function loadArtistTracks() {
       continue;
     }
 
-    // Pick best match
     const artistResult = searchRes.artists.items[0];
     const artistId = artistResult.id;
 
-    // Get top tracks
     const topRes = await spotifyFetch(`/artists/${artistId}/top-tracks?market=US`);
     if (!topRes || !topRes.tracks || topRes.tracks.length === 0) {
       console.warn(`No tracks for: ${name}`);
@@ -1027,7 +1026,6 @@ async function loadArtistTracks() {
       continue;
     }
 
-    // Take up to 10 tracks (weighted toward popular = they're already sorted by popularity)
     const tracks = topRes.tracks.slice(0, 10).map(t => ({
       id: t.id,
       uri: t.uri,
@@ -1046,13 +1044,29 @@ async function loadArtistTracks() {
       avgRating: 0
     };
 
+    // Add this artist's tracks to the queue in shuffled positions
+    for (const track of tracks) {
+      const pos = Math.floor(Math.random() * (songQueue.length + 1));
+      songQueue.splice(pos, 0, { artist: name, track });
+    }
+
     loaded++;
-    // Delay after every artist to stay under Spotify rate limits (403/429)
+    updateStats();
+    renderLeaderboards();
+
+    // Start playing as soon as the first artist is loaded
+    if (!firstSongPlayed && songQueue.length > 0) {
+      firstSongPlayed = true;
+      playNext();
+    }
+
     await sleep(450);
   }
 
-  buildQueue();
+  loadingInBackground = false;
+  checkFinishEligibility();
   saveSession();
+  showToast(`All ${Object.keys(artists).length} artists loaded!`, 'kept-toast');
 }
 
 function buildQueue() {
@@ -1443,11 +1457,7 @@ function restartSession() {
   currentSong = null;
   document.getElementById('results-screen').style.display = 'none';
   document.getElementById('player-section').style.display = 'block';
-  loadArtistTracks().then(() => {
-    updateStats();
-    renderLeaderboards();
-    playNext();
-  });
+  loadArtistTracksInBackground();
 }
 
 // ═══════════════════════════════════════════
