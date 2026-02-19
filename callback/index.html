@@ -1190,6 +1190,7 @@ async function refreshAccessToken() {
 // ═══════════════════════════════════════════
 const SPOTIFY_RETRY_MAX = 5;
 let apiDelayMs = 2000;
+const DEBUG_RUN_ID = `run_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
 let isRefreshing = false;
 
@@ -1217,6 +1218,9 @@ async function spotifyFetch(endpoint, options = {}, retriesLeft = SPOTIFY_RETRY_
   if (res.status === 429 && retriesLeft > 0) {
     const retrySec = res.headers.get('Retry-After');
     const waitMs = retrySec ? parseInt(retrySec, 10) * 1000 : 5000 * Math.pow(2, SPOTIFY_RETRY_MAX - retriesLeft);
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/71d6c798-9378-4e27-8468-570123fd153e',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({runId:DEBUG_RUN_ID,hypothesisId:'H2',location:'callback/index.html:429-branch',message:'Spotify 429 encountered',data:{endpoint,status:res.status,retriesLeft,retryAfterSec:retrySec,waitMs,apiDelayMsBefore:apiDelayMs},timestamp:Date.now()})}).catch(()=>{});
+    // #endregion
     apiDelayMs = Math.min(apiDelayMs * 2, 8000);
     console.log(`Rate limited — waiting ${Math.round(waitMs/1000)}s (delay now ${apiDelayMs}ms)`);
     await sleep(waitMs);
@@ -1229,6 +1233,9 @@ async function spotifyFetch(endpoint, options = {}, retriesLeft = SPOTIFY_RETRY_
   }
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/71d6c798-9378-4e27-8468-570123fd153e',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({runId:DEBUG_RUN_ID,hypothesisId:'H4',location:'callback/index.html:non-ok-response',message:'Spotify non-ok response',data:{endpoint,status:res.status,error:err},timestamp:Date.now()})}).catch(()=>{});
+    // #endregion
     console.error('Spotify API error:', res.status, err);
     return null;
   }
@@ -1362,11 +1369,17 @@ function loadCacheIntoState(cacheData, source) {
 }
 
 async function loadArtistTracksInBackground() {
+  // #region agent log
+  fetch('http://127.0.0.1:7242/ingest/71d6c798-9378-4e27-8468-570123fd153e',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({runId:DEBUG_RUN_ID,hypothesisId:'H1',location:'callback/index.html:loadArtistTracksInBackground-entry',message:'Background artist load entry',data:{loadingInBackgroundBefore:loadingInBackground,songQueueLength:songQueue.length,artistsTracked:Object.keys(artists).length},timestamp:Date.now()})}).catch(()=>{});
+  // #endregion
   loadingInBackground = true;
 
   // Priority 1: Firestore shared cache (one fetch serves all users)
   const fbCached = await fbGetTrackCache();
   if (fbCached) {
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/71d6c798-9378-4e27-8468-570123fd153e',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({runId:DEBUG_RUN_ID,hypothesisId:'H3',location:'callback/index.html:cache-firestore-hit',message:'Using Firestore track cache',data:{cachedArtists:Object.keys(fbCached).length},timestamp:Date.now()})}).catch(()=>{});
+    // #endregion
     loadCacheIntoState(fbCached, 'Firestore');
     saveTrackCache(fbCached);
     updateStats();
@@ -1382,6 +1395,9 @@ async function loadArtistTracksInBackground() {
   // Priority 2: localStorage cache (offline / faster fallback)
   const lsCached = getTrackCache();
   if (lsCached) {
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/71d6c798-9378-4e27-8468-570123fd153e',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({runId:DEBUG_RUN_ID,hypothesisId:'H3',location:'callback/index.html:cache-localstorage-hit',message:'Using localStorage track cache',data:{cachedArtists:Object.keys(lsCached).length},timestamp:Date.now()})}).catch(()=>{});
+    // #endregion
     loadCacheIntoState(lsCached, 'localStorage');
     fbSaveTrackCache(lsCached);
     updateStats();
@@ -1395,6 +1411,9 @@ async function loadArtistTracksInBackground() {
   }
 
   // Priority 3: Fresh fetch from Spotify API
+  // #region agent log
+  fetch('http://127.0.0.1:7242/ingest/71d6c798-9378-4e27-8468-570123fd153e',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({runId:DEBUG_RUN_ID,hypothesisId:'H3',location:'callback/index.html:cache-miss-fresh-fetch',message:'No cache found, starting fresh Spotify fetch loop',data:{artistCount:COACHELLA_ARTISTS.length,initialApiDelayMs:apiDelayMs},timestamp:Date.now()})}).catch(()=>{});
+  // #endregion
   let loaded = 0;
   let firstSongPlayed = false;
   let consecutiveFailures = 0;
@@ -1413,6 +1432,9 @@ async function loadArtistTracksInBackground() {
       `/search?q=${encodeURIComponent('artist:' + name)}&type=track&limit=10`
     );
     if (!searchRes || !searchRes.tracks || !searchRes.tracks.items.length) {
+      // #region agent log
+      fetch('http://127.0.0.1:7242/ingest/71d6c798-9378-4e27-8468-570123fd153e',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({runId:DEBUG_RUN_ID,hypothesisId:'H4',location:'callback/index.html:no-tracks-branch',message:'Artist search returned no usable tracks payload',data:{artist:name,loaded,consecutiveFailures,apiDelayMs},timestamp:Date.now()})}).catch(()=>{});
+      // #endregion
       console.warn(`No tracks found for: ${name}`);
       loaded++;
       consecutiveFailures++;
@@ -2114,6 +2136,9 @@ function showToast(msg, extraClass = '') {
     accessToken = token;
     const me = await spotifyFetch('/me');
     if (me) {
+      // #region agent log
+      fetch('http://127.0.0.1:7242/ingest/71d6c798-9378-4e27-8468-570123fd153e',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({runId:DEBUG_RUN_ID,hypothesisId:'H5',location:'callback/index.html:boot-token-path',message:'Boot entered token-valid init path',data:{isExpired,hasRefreshToken:!!refreshToken},timestamp:Date.now()})}).catch(()=>{});
+      // #endregion
       await initApp();
       return;
     }
@@ -2122,6 +2147,9 @@ function showToast(msg, extraClass = '') {
   if (refreshToken) {
     const refreshed = await refreshAccessToken();
     if (refreshed) {
+      // #region agent log
+      fetch('http://127.0.0.1:7242/ingest/71d6c798-9378-4e27-8468-570123fd153e',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({runId:DEBUG_RUN_ID,hypothesisId:'H5',location:'callback/index.html:boot-refresh-path',message:'Boot entered refresh-token init path',data:{isExpired,hasRefreshToken:!!refreshToken},timestamp:Date.now()})}).catch(()=>{});
+      // #endregion
       await initApp();
       return;
     }
