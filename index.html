@@ -1729,37 +1729,58 @@ async function ensureDevice() {
 // ═══════════════════════════════════════════
 // PLAYBACK
 // ═══════════════════════════════════════════
+let playNextInProgress = false;
+let playNextPending = false;
+let previousSong = null; // last played song, for "previous track"
+
 async function playNext() {
-  // Remove songs from eliminated artists
-  songQueue = songQueue.filter(s => !artists[s.artist]?.eliminated);
-
-  if (songQueue.length === 0) {
-    // Rebuild queue from non-eliminated artists with unplayed or less-played tracks
-    buildQueue();
-    if (songQueue.length === 0) {
-      showToast('All songs have been played! Check your results.');
-      return;
-    }
+  if (playNextInProgress) {
+    playNextPending = true;
+    return;
   }
+  playNextInProgress = true;
+  playNextPending = false;
+  if (window._trackEndFired) window._trackEndFired = false;
 
-  currentSong = songQueue.shift();
-  updateNowPlaying();
+  try {
+    // Remove songs from eliminated artists
+    songQueue = songQueue.filter(s => !artists[s.artist]?.eliminated);
 
-  // Play on Spotify
-  const hasDevice = await ensureDevice();
-  if (!hasDevice) return;
+    if (songQueue.length === 0) {
+      // Rebuild queue from non-eliminated artists with unplayed or less-played tracks
+      buildQueue();
+      if (songQueue.length === 0) {
+        showToast('All songs have been played! Check your results.');
+        return;
+      }
+    }
 
-  const res = await spotifyFetch(`/me/player/play?device_id=${deviceId}`, {
-    method: 'PUT',
-    body: JSON.stringify({ uris: [currentSong.track.uri] })
-  });
+    if (currentSong) previousSong = currentSong;
+    currentSong = songQueue.shift();
+    updateNowPlaying();
 
-  if (res === null) {
-    showError('Playback failed. Make sure Spotify is open and active.');
-  } else {
-    isPlaying = true;
-    updatePlayPauseIcon();
-    hideError();
+    // Play on Spotify
+    const hasDevice = await ensureDevice();
+    if (!hasDevice) return;
+
+    const res = await spotifyFetch(`/me/player/play?device_id=${deviceId}`, {
+      method: 'PUT',
+      body: JSON.stringify({ uris: [currentSong.track.uri] })
+    });
+
+    if (res === null) {
+      showError('Playback failed. Make sure Spotify is open and active.');
+    } else {
+      isPlaying = true;
+      updatePlayPauseIcon();
+      hideError();
+    }
+  } finally {
+    playNextInProgress = false;
+    if (playNextPending) {
+      playNextPending = false;
+      setTimeout(() => playNext(), 0);
+    }
   }
 }
 
@@ -1801,12 +1822,37 @@ function updatePlayPauseIcon() {
 }
 
 async function skipToNext() {
+  if (window._ratingAdvanceTimeout) {
+    clearTimeout(window._ratingAdvanceTimeout);
+    window._ratingAdvanceTimeout = null;
+  }
   playNext();
 }
 
 async function previousTrack() {
-  // Restart current track
-  if (currentSong) {
+  if (window._ratingAdvanceTimeout) {
+    clearTimeout(window._ratingAdvanceTimeout);
+    window._ratingAdvanceTimeout = null;
+  }
+  if (previousSong) {
+    // Go back to the previous song: put current back at front of queue, then play previous
+    if (currentSong) songQueue.unshift(currentSong);
+    currentSong = previousSong;
+    previousSong = null;
+    updateNowPlaying();
+    const hasDevice = await ensureDevice();
+    if (hasDevice) {
+      await spotifyFetch(`/me/player/play?device_id=${deviceId}`, {
+        method: 'PUT',
+        body: JSON.stringify({ uris: [currentSong.track.uri] })
+      });
+      isPlaying = true;
+      updatePlayPauseIcon();
+      hideError();
+    }
+  } else if (currentSong) {
+    // No history: restart current track from the beginning
+    await ensureDevice();
     await spotifyFetch(`/me/player/play?device_id=${deviceId}`, {
       method: 'PUT',
       body: JSON.stringify({ uris: [currentSong.track.uri] })
@@ -1863,11 +1909,19 @@ function rate(score) {
   checkFinishEligibility();
   saveSession();
 
-  // Auto-advance after brief delay
-  setTimeout(() => playNext(), 800);
+  // Auto-advance after brief delay (cancel any previous pending advance)
+  if (window._ratingAdvanceTimeout) clearTimeout(window._ratingAdvanceTimeout);
+  window._ratingAdvanceTimeout = setTimeout(() => {
+    window._ratingAdvanceTimeout = null;
+    playNext();
+  }, 800);
 }
 
 function skipSong() {
+  if (window._ratingAdvanceTimeout) {
+    clearTimeout(window._ratingAdvanceTimeout);
+    window._ratingAdvanceTimeout = null;
+  }
   playNext();
 }
 
