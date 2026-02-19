@@ -1122,7 +1122,9 @@ async function exchangeCode(code) {
 // ═══════════════════════════════════════════
 // SPOTIFY API HELPERS
 // ═══════════════════════════════════════════
-const SPOTIFY_RETRY_MAX = 3;
+const SPOTIFY_RETRY_MAX = 5;
+let apiDelayMs = 1500;
+
 async function spotifyFetch(endpoint, options = {}, retriesLeft = SPOTIFY_RETRY_MAX) {
   const url = endpoint.startsWith('http') ? endpoint : `https://api.spotify.com/v1${endpoint}`;
   const res = await fetch(url, {
@@ -1140,10 +1142,16 @@ async function spotifyFetch(endpoint, options = {}, retriesLeft = SPOTIFY_RETRY_
     return null;
   }
   if (res.status === 204 || res.status === 202) return {};
-  // Retry on rate limit (429) or quota/forbidden (403) with backoff
-  if ((res.status === 403 || res.status === 429) && retriesLeft > 0) {
+  if (res.status === 429 && retriesLeft > 0) {
     const retrySec = res.headers.get('Retry-After');
-    const waitMs = retrySec ? Math.min(parseInt(retrySec, 10) * 1000, 15000) : Math.min(2000 * Math.pow(2, SPOTIFY_RETRY_MAX - retriesLeft), 12000);
+    const waitMs = retrySec ? parseInt(retrySec, 10) * 1000 : 5000 * Math.pow(2, SPOTIFY_RETRY_MAX - retriesLeft);
+    apiDelayMs = Math.min(apiDelayMs * 2, 8000);
+    console.log(`Rate limited — waiting ${Math.round(waitMs/1000)}s (delay now ${apiDelayMs}ms)`);
+    await sleep(waitMs);
+    return spotifyFetch(endpoint, options, retriesLeft - 1);
+  }
+  if (res.status === 403 && retriesLeft > 0) {
+    const waitMs = 3000 * Math.pow(2, SPOTIFY_RETRY_MAX - retriesLeft);
     await sleep(waitMs);
     return spotifyFetch(endpoint, options, retriesLeft - 1);
   }
@@ -1240,11 +1248,63 @@ async function initApp() {
   loadArtistTracksInBackground();
 }
 
+function getTrackCache() {
+  try {
+    const raw = localStorage.getItem('track_cache');
+    if (!raw) return null;
+    const cache = JSON.parse(raw);
+    const ageHours = (Date.now() - (cache.ts || 0)) / 3600000;
+    if (ageHours > 24) { localStorage.removeItem('track_cache'); return null; }
+    return cache.data;
+  } catch { return null; }
+}
+
+function saveTrackCache(data) {
+  try {
+    localStorage.setItem('track_cache', JSON.stringify({ ts: Date.now(), data }));
+  } catch { /* storage full */ }
+}
+
 async function loadArtistTracksInBackground() {
   loadingInBackground = true;
   let loaded = 0;
   let firstSongPlayed = false;
 
+  // Try loading from cache first (avoids hammering Spotify API)
+  const cached = getTrackCache();
+  if (cached) {
+    console.log('Loading tracks from cache');
+    for (const name of COACHELLA_ARTISTS) {
+      const c = cached[name];
+      if (!c || !c.tracks.length) { loaded++; continue; }
+      const existing = artists[name] || { ratings: [], eliminated: false, avgRating: 0 };
+      artists[name] = {
+        spotifyId: c.spotifyId,
+        tracks: c.tracks,
+        ratings: existing.ratings,
+        eliminated: existing.eliminated,
+        avgRating: existing.avgRating
+      };
+      for (const track of c.tracks) {
+        const pos = Math.floor(Math.random() * (songQueue.length + 1));
+        songQueue.splice(pos, 0, { artist: name, track });
+      }
+      loaded++;
+      document.getElementById('progress-fill').style.width =
+        ((loaded / COACHELLA_ARTISTS.length) * 100) + '%';
+    }
+    updateStats();
+    renderLeaderboards();
+    checkFinishEligibility();
+    loadingInBackground = false;
+    if (songQueue.length > 0) await playNext();
+    saveSession();
+    showToast(`All ${Object.keys(artists).length} artists loaded!`, 'kept-toast');
+    return;
+  }
+
+  // No cache — fetch from Spotify API with throttling
+  const trackData = {};
   for (const name of COACHELLA_ARTISTS) {
     document.getElementById('progress-fill').style.width =
       ((loaded / COACHELLA_ARTISTS.length) * 100) + '%';
@@ -1255,7 +1315,7 @@ async function loadArtistTracksInBackground() {
     if (!searchRes || !searchRes.tracks || !searchRes.tracks.items.length) {
       console.warn(`No tracks found for: ${name}`);
       loaded++;
-      await sleep(450);
+      await sleep(apiDelayMs);
       continue;
     }
 
@@ -1269,12 +1329,14 @@ async function loadArtistTracksInBackground() {
     }));
 
     const firstArtist = searchRes.tracks.items[0]?.artists?.[0];
+    const spotifyId = firstArtist?.id || '';
 
-    // Merge with existing data (preserves Firebase-restored ratings)
+    trackData[name] = { spotifyId, tracks };
+
     const existing = artists[name] || { ratings: [], eliminated: false, avgRating: 0 };
     artists[name] = {
-      spotifyId: firstArtist?.id || '',
-      tracks: tracks,
+      spotifyId,
+      tracks,
       ratings: existing.ratings,
       eliminated: existing.eliminated,
       avgRating: existing.avgRating
@@ -1294,9 +1356,10 @@ async function loadArtistTracksInBackground() {
       await playNext();
     }
 
-    await sleep(450);
+    await sleep(apiDelayMs);
   }
 
+  saveTrackCache(trackData);
   loadingInBackground = false;
   checkFinishEligibility();
   saveSession();
