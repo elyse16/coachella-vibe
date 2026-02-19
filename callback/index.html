@@ -1123,7 +1123,7 @@ async function exchangeCode(code) {
 // SPOTIFY API HELPERS
 // ═══════════════════════════════════════════
 const SPOTIFY_RETRY_MAX = 5;
-let apiDelayMs = 1500;
+let apiDelayMs = 2000;
 
 async function spotifyFetch(endpoint, options = {}, retriesLeft = SPOTIFY_RETRY_MAX) {
   const url = endpoint.startsWith('http') ? endpoint : `https://api.spotify.com/v1${endpoint}`;
@@ -1315,7 +1315,12 @@ async function loadArtistTracksInBackground() {
     if (!searchRes || !searchRes.tracks || !searchRes.tracks.items.length) {
       console.warn(`No tracks found for: ${name}`);
       loaded++;
-      await sleep(apiDelayMs);
+      if (loaded <= 2 && !searchRes) {
+        showToast('Spotify is rate-limiting requests. Waiting 30s before retrying...', 'eliminated-toast');
+        await sleep(30000);
+      } else {
+        await sleep(apiDelayMs);
+      }
       continue;
     }
 
