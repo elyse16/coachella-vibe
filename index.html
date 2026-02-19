@@ -1424,6 +1424,11 @@ function initWebPlayer() {
       });
       spotifyPlayer.addListener('authentication_error', ({ message }) => {
         console.error('SDK auth error:', message);
+        localStorage.removeItem('spotify_token');
+        localStorage.removeItem('spotify_expiry');
+        localStorage.removeItem('spotify_scopes');
+        showError('Spotify session needs to be refreshed. Reconnecting...');
+        setTimeout(() => { document.getElementById('login-screen').style.display = 'flex'; document.getElementById('player-section').style.display = 'none'; }, 1500);
         done(false);
       });
       spotifyPlayer.addListener('playback_error', ({ message }) => {
