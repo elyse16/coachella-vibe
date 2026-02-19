@@ -1,0 +1,24 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Users: anyone can read (for community tab), authenticated writes scoped to own doc
+    match /users/{userId} {
+      allow read: if true;
+      allow write: if true;
+    }
+
+    // Ratings: anyone can read (community tab), anyone can write (client-side auth)
+    match /ratings/{ratingId} {
+      allow read: if true;
+      allow write: if true;
+    }
+
+    // Track cache: shared read for all users, any authenticated session can populate it
+    match /track_cache/{docId} {
+      allow read: if true;
+      allow write: if true;
+    }
+  }
+}

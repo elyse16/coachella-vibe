@@ -927,6 +927,7 @@ const CLIENT_ID = 'a9efe27c3e7e4ba09df58d3b6e4448de';
 const REDIRECT_URI = 'https://elyse16.github.io/coachella-vibe/callback';
 const SCOPES = [
   'user-read-private',
+  'user-read-email',
   'user-read-playback-state',
   'user-modify-playback-state',
   'user-read-currently-playing',
@@ -986,11 +987,13 @@ const COACHELLA_ARTISTS = [
 // STATE
 // ═══════════════════════════════════════════
 let accessToken = null;
+let refreshToken = null;
 let userId = null;
 let userDisplayName = null;
 let userAvatar = null;
-let artists = {}; // { name: { tracks: [], ratings: [], eliminated: false, avgRating: 0 } }
-let songQueue = []; // shuffled array of { artist, track }
+let userEmail = null;
+let artists = {};
+let songQueue = [];
 let currentSong = null;
 let isPlaying = false;
 let totalRated = 0;
@@ -999,13 +1002,15 @@ let deviceId = null;
 // ═══════════════════════════════════════════
 // FIRESTORE HELPERS
 // ═══════════════════════════════════════════
-async function fbUpsertUser(spotifyId, displayName, avatarUrl) {
+async function fbUpsertUser(spotifyId, displayName, avatarUrl, email) {
   try {
-    await db.collection('users').doc(spotifyId).set({
+    const userData = {
       display_name: displayName || 'Unknown',
       avatar_url: avatarUrl || '',
       last_seen: firebase.firestore.FieldValue.serverTimestamp()
-    }, { merge: true });
+    };
+    if (email) userData.email = email;
+    await db.collection('users').doc(spotifyId).set(userData, { merge: true });
   } catch (e) { console.warn('Firebase user upsert failed:', e); }
 }
 
@@ -1054,6 +1059,36 @@ async function fbLoadAllUsers() {
     console.warn('Firebase load users failed:', e);
     return {};
   }
+}
+
+// ═══════════════════════════════════════════
+// FIRESTORE TRACK CACHE (shared across all users)
+// ═══════════════════════════════════════════
+const TRACK_CACHE_DOC = 'coachella_2026';
+const TRACK_CACHE_TTL_HOURS = 168;
+
+async function fbGetTrackCache() {
+  try {
+    const doc = await db.collection('track_cache').doc(TRACK_CACHE_DOC).get();
+    if (!doc.exists) return null;
+    const cache = doc.data();
+    const ageHours = (Date.now() - (cache.updated_at?.toMillis() || 0)) / 3600000;
+    if (ageHours > TRACK_CACHE_TTL_HOURS) return null;
+    return cache.data;
+  } catch (e) {
+    console.warn('Firestore track cache read failed:', e);
+    return null;
+  }
+}
+
+async function fbSaveTrackCache(data) {
+  try {
+    await db.collection('track_cache').doc(TRACK_CACHE_DOC).set({
+      data: data,
+      updated_at: firebase.firestore.FieldValue.serverTimestamp(),
+      artist_count: Object.keys(data).length
+    });
+  } catch (e) { console.warn('Firestore track cache save failed:', e); }
 }
 
 // ═══════════════════════════════════════════
@@ -1107,10 +1142,13 @@ async function exchangeCode(code) {
   const data = await response.json();
   if (data.access_token) {
     accessToken = data.access_token;
+    if (data.refresh_token) {
+      refreshToken = data.refresh_token;
+      localStorage.setItem('spotify_refresh_token', refreshToken);
+    }
     localStorage.setItem('spotify_token', accessToken);
     localStorage.setItem('spotify_token_time', Date.now().toString());
     localStorage.setItem('spotify_scopes', SCOPES);
-    // Clean up URL
     window.history.replaceState({}, document.title, REDIRECT_URI);
     await initApp();
   } else {
@@ -1119,11 +1157,41 @@ async function exchangeCode(code) {
   }
 }
 
+async function refreshAccessToken() {
+  const stored = localStorage.getItem('spotify_refresh_token');
+  if (!stored) return false;
+  try {
+    const response = await fetch('https://accounts.spotify.com/api/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        client_id: CLIENT_ID,
+        grant_type: 'refresh_token',
+        refresh_token: stored
+      })
+    });
+    const data = await response.json();
+    if (data.access_token) {
+      accessToken = data.access_token;
+      localStorage.setItem('spotify_token', accessToken);
+      localStorage.setItem('spotify_token_time', Date.now().toString());
+      if (data.refresh_token) {
+        refreshToken = data.refresh_token;
+        localStorage.setItem('spotify_refresh_token', refreshToken);
+      }
+      return true;
+    }
+  } catch (e) { console.warn('Token refresh failed:', e); }
+  return false;
+}
+
 // ═══════════════════════════════════════════
 // SPOTIFY API HELPERS
 // ═══════════════════════════════════════════
 const SPOTIFY_RETRY_MAX = 5;
 let apiDelayMs = 2000;
+
+let isRefreshing = false;
 
 async function spotifyFetch(endpoint, options = {}, retriesLeft = SPOTIFY_RETRY_MAX) {
   const url = endpoint.startsWith('http') ? endpoint : `https://api.spotify.com/v1${endpoint}`;
@@ -1135,7 +1203,11 @@ async function spotifyFetch(endpoint, options = {}, retriesLeft = SPOTIFY_RETRY_
       ...options.headers
     }
   });
-  if (res.status === 401) {
+  if (res.status === 401 && !isRefreshing) {
+    isRefreshing = true;
+    const refreshed = await refreshAccessToken();
+    isRefreshing = false;
+    if (refreshed) return spotifyFetch(endpoint, options, retriesLeft);
     showError('Session expired. Please reconnect.');
     document.getElementById('login-screen').style.display = 'flex';
     document.getElementById('player-section').style.display = 'none';
@@ -1150,10 +1222,10 @@ async function spotifyFetch(endpoint, options = {}, retriesLeft = SPOTIFY_RETRY_
     await sleep(waitMs);
     return spotifyFetch(endpoint, options, retriesLeft - 1);
   }
-  if (res.status === 403 && retriesLeft > 0) {
-    const waitMs = 3000 * Math.pow(2, SPOTIFY_RETRY_MAX - retriesLeft);
-    await sleep(waitMs);
-    return spotifyFetch(endpoint, options, retriesLeft - 1);
+  if (res.status === 403) {
+    const err = await res.json().catch(() => ({}));
+    console.error('Spotify 403 Forbidden:', endpoint, err);
+    return null;
   }
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
@@ -1173,15 +1245,14 @@ async function initApp() {
   document.getElementById('login-screen').style.display = 'none';
   document.getElementById('player-section').style.display = 'block';
 
-  // Get user ID and profile
   const me = await spotifyFetch('/me');
   if (!me) { hideLoading(); return; }
   userId = me.id;
   userDisplayName = me.display_name || me.id;
   userAvatar = (me.images && me.images.length > 0) ? me.images[0].url : '';
+  userEmail = me.email || null;
 
-  // Upsert to Firebase (fire-and-forget)
-  fbUpsertUser(userId, userDisplayName, userAvatar);
+  fbUpsertUser(userId, userDisplayName, userAvatar, userEmail);
 
   // Start in-browser Spotify player
   showLoading('Starting Spotify player...');
@@ -1265,34 +1336,39 @@ function saveTrackCache(data) {
   } catch { /* storage full */ }
 }
 
+function loadCacheIntoState(cacheData, source) {
+  let loaded = 0;
+  for (const name of COACHELLA_ARTISTS) {
+    const c = cacheData[name];
+    if (!c || !c.tracks || !c.tracks.length) { loaded++; continue; }
+    const existing = artists[name] || { ratings: [], eliminated: false, avgRating: 0 };
+    artists[name] = {
+      spotifyId: c.spotifyId,
+      tracks: c.tracks,
+      ratings: existing.ratings,
+      eliminated: existing.eliminated,
+      avgRating: existing.avgRating
+    };
+    for (const track of c.tracks) {
+      const pos = Math.floor(Math.random() * (songQueue.length + 1));
+      songQueue.splice(pos, 0, { artist: name, track });
+    }
+    loaded++;
+    document.getElementById('progress-fill').style.width =
+      ((loaded / COACHELLA_ARTISTS.length) * 100) + '%';
+  }
+  console.log(`Loaded ${loaded} artists from ${source}`);
+  return loaded;
+}
+
 async function loadArtistTracksInBackground() {
   loadingInBackground = true;
-  let loaded = 0;
-  let firstSongPlayed = false;
 
-  // Try loading from cache first (avoids hammering Spotify API)
-  const cached = getTrackCache();
-  if (cached) {
-    console.log('Loading tracks from cache');
-    for (const name of COACHELLA_ARTISTS) {
-      const c = cached[name];
-      if (!c || !c.tracks.length) { loaded++; continue; }
-      const existing = artists[name] || { ratings: [], eliminated: false, avgRating: 0 };
-      artists[name] = {
-        spotifyId: c.spotifyId,
-        tracks: c.tracks,
-        ratings: existing.ratings,
-        eliminated: existing.eliminated,
-        avgRating: existing.avgRating
-      };
-      for (const track of c.tracks) {
-        const pos = Math.floor(Math.random() * (songQueue.length + 1));
-        songQueue.splice(pos, 0, { artist: name, track });
-      }
-      loaded++;
-      document.getElementById('progress-fill').style.width =
-        ((loaded / COACHELLA_ARTISTS.length) * 100) + '%';
-    }
+  // Priority 1: Firestore shared cache (one fetch serves all users)
+  const fbCached = await fbGetTrackCache();
+  if (fbCached) {
+    loadCacheIntoState(fbCached, 'Firestore');
+    saveTrackCache(fbCached);
     updateStats();
     renderLeaderboards();
     checkFinishEligibility();
@@ -1303,11 +1379,35 @@ async function loadArtistTracksInBackground() {
     return;
   }
 
-  // No cache — fetch from Spotify API with throttling
+  // Priority 2: localStorage cache (offline / faster fallback)
+  const lsCached = getTrackCache();
+  if (lsCached) {
+    loadCacheIntoState(lsCached, 'localStorage');
+    fbSaveTrackCache(lsCached);
+    updateStats();
+    renderLeaderboards();
+    checkFinishEligibility();
+    loadingInBackground = false;
+    if (songQueue.length > 0) await playNext();
+    saveSession();
+    showToast(`All ${Object.keys(artists).length} artists loaded!`, 'kept-toast');
+    return;
+  }
+
+  // Priority 3: Fresh fetch from Spotify API
+  let loaded = 0;
+  let firstSongPlayed = false;
+  let consecutiveFailures = 0;
   const trackData = {};
+
   for (const name of COACHELLA_ARTISTS) {
     document.getElementById('progress-fill').style.width =
       ((loaded / COACHELLA_ARTISTS.length) * 100) + '%';
+
+    if (consecutiveFailures >= 5) {
+      showToast('Too many API failures. Using partial data.', 'eliminated-toast');
+      break;
+    }
 
     const searchRes = await spotifyFetch(
       `/search?q=${encodeURIComponent('artist:' + name)}&type=track&limit=10`
@@ -1315,15 +1415,12 @@ async function loadArtistTracksInBackground() {
     if (!searchRes || !searchRes.tracks || !searchRes.tracks.items.length) {
       console.warn(`No tracks found for: ${name}`);
       loaded++;
-      if (loaded <= 2 && !searchRes) {
-        showToast('Spotify is rate-limiting requests. Waiting 30s before retrying...', 'eliminated-toast');
-        await sleep(30000);
-      } else {
-        await sleep(apiDelayMs);
-      }
+      consecutiveFailures++;
+      await sleep(apiDelayMs);
       continue;
     }
 
+    consecutiveFailures = 0;
     const tracks = searchRes.tracks.items.map(t => ({
       id: t.id,
       uri: t.uri,
@@ -1334,13 +1431,13 @@ async function loadArtistTracksInBackground() {
     }));
 
     const firstArtist = searchRes.tracks.items[0]?.artists?.[0];
-    const spotifyId = firstArtist?.id || '';
+    const spotId = firstArtist?.id || '';
 
-    trackData[name] = { spotifyId, tracks };
+    trackData[name] = { spotifyId: spotId, tracks };
 
     const existing = artists[name] || { ratings: [], eliminated: false, avgRating: 0 };
     artists[name] = {
-      spotifyId,
+      spotifyId: spotId,
       tracks,
       ratings: existing.ratings,
       eliminated: existing.eliminated,
@@ -1365,6 +1462,7 @@ async function loadArtistTracksInBackground() {
   }
 
   saveTrackCache(trackData);
+  fbSaveTrackCache(trackData);
   loadingInBackground = false;
   checkFinishEligibility();
   saveSession();
@@ -1911,7 +2009,7 @@ async function createPlaylist() {
   // Add tracks in batches of 100
   for (let i = 0; i < uniqueUris.length; i += 100) {
     const batch = uniqueUris.slice(i, i + 100);
-    await spotifyFetch(`/playlists/${playlist.id}/tracks`, {
+    await spotifyFetch(`/playlists/${playlist.id}/items`, {
       method: 'POST',
       body: JSON.stringify({ uris: batch })
     });
@@ -1929,6 +2027,7 @@ async function createPlaylist() {
 
 function restartSession() {
   localStorage.removeItem('vibe_session');
+  artists = {};
   totalRated = 0;
   songQueue = [];
   currentSong = null;
@@ -1996,16 +2095,23 @@ function showToast(msg, extraClass = '') {
     return;
   }
 
-  // Check for existing token
   const token = localStorage.getItem('spotify_token');
   const tokenTime = parseInt(localStorage.getItem('spotify_token_time') || '0');
-  const isExpired = Date.now() - tokenTime > 3500000; // ~58 min
+  const isExpired = Date.now() - tokenTime > 3500000;
   const savedScopes = localStorage.getItem('spotify_scopes') || '';
   const scopesChanged = savedScopes !== SCOPES;
+  refreshToken = localStorage.getItem('spotify_refresh_token');
 
-  if (token && !isExpired && !scopesChanged) {
+  if (scopesChanged && refreshToken) {
+    localStorage.removeItem('spotify_token');
+    localStorage.removeItem('spotify_refresh_token');
+    localStorage.removeItem('spotify_scopes');
+    document.getElementById('login-screen').style.display = 'flex';
+    return;
+  }
+
+  if (token && !isExpired) {
     accessToken = token;
-    // Verify token is still valid
     const me = await spotifyFetch('/me');
     if (me) {
       await initApp();
@@ -2013,7 +2119,14 @@ function showToast(msg, extraClass = '') {
     }
   }
 
-  // Show login
+  if (refreshToken) {
+    const refreshed = await refreshAccessToken();
+    if (refreshed) {
+      await initApp();
+      return;
+    }
+  }
+
   document.getElementById('login-screen').style.display = 'flex';
 })();
 </script>
