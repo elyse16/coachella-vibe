@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>COACHELLA</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎪</text></svg>">
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Dela+Gothic+One&family=DM+Sans:ital,wght@0,300;0,400;0,500;0,700;1,400&display=swap');
 
@@ -1249,7 +1250,9 @@ async function spotifyFetch(endpoint, options = {}, retriesLeft = SPOTIFY_RETRY_
     globalRateLimitUntilMs = Date.now() + waitMs;
     spotifyRateLimitTriggered = true;
     apiDelayMs = Math.min(apiDelayMs * 2, 8000);
-    console.log(`Rate limited — waiting ${Math.round(waitMs/1000)}s (delay now ${apiDelayMs}ms)`);
+    const waitSec = Math.round(waitMs / 1000);
+    console.log(`Rate limited — waiting ${waitSec}s (delay now ${apiDelayMs}ms)`);
+    showToast(`Spotify rate limited — retrying in ${waitSec}s…`, 'eliminated-toast');
     // Search is the hottest endpoint; fail fast and let outer flow cool down.
     if (endpoint.includes('/search')) return null;
     // Honor Retry-After/global gate before retrying non-search calls.
@@ -1731,7 +1734,8 @@ async function ensureDevice() {
 // ═══════════════════════════════════════════
 let playNextInProgress = false;
 let playNextPending = false;
-let previousSong = null; // last played song, for "previous track"
+const PLAYED_HISTORY_MAX = 20;
+let playedHistory = []; // recent songs for "previous track" (newest at end)
 
 async function playNext() {
   if (playNextInProgress) {
@@ -1755,7 +1759,10 @@ async function playNext() {
       }
     }
 
-    if (currentSong) previousSong = currentSong;
+    if (currentSong) {
+      playedHistory.push(currentSong);
+      if (playedHistory.length > PLAYED_HISTORY_MAX) playedHistory.shift();
+    }
     currentSong = songQueue.shift();
     updateNowPlaying();
 
@@ -1834,11 +1841,10 @@ async function previousTrack() {
     clearTimeout(window._ratingAdvanceTimeout);
     window._ratingAdvanceTimeout = null;
   }
-  if (previousSong) {
-    // Go back to the previous song: put current back at front of queue, then play previous
+  if (playedHistory.length > 0) {
+    // Go back one song: put current at front of queue, pop last from history, play it
     if (currentSong) songQueue.unshift(currentSong);
-    currentSong = previousSong;
-    previousSong = null;
+    currentSong = playedHistory.pop();
     updateNowPlaying();
     const hasDevice = await ensureDevice();
     if (hasDevice) {
