@@ -1674,6 +1674,16 @@ function initWebPlayer() {
         if (!state) return;
         isPlaying = !state.paused;
         updatePlayPauseIcon();
+        // When the track ends (paused at end), skip without rating and play next
+        const pos = state.position;
+        const dur = state.duration;
+        const atEnd = state.paused && (pos === 0 || (dur > 0 && pos >= dur - 1));
+        const currentUri = state.track_window?.current_track?.uri;
+        if (atEnd && currentSong && currentUri === currentSong.track.uri && !window._trackEndFired) {
+          window._trackEndFired = true;
+          playNext();
+        }
+        if (!state.paused) window._trackEndFired = false;
       });
       spotifyPlayer.connect();
     }
