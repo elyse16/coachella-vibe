@@ -1203,7 +1203,7 @@ async function initApp() {
       }));
       const avg = ratings.reduce((a, r) => a + r.score, 0) / ratings.length;
       artists[name].avgRating = Math.round(avg * 10) / 10;
-      if (avg < 3) artists[name].eliminated = true;
+      if (ratings.length >= MIN_RATINGS && avg < ELIMINATION_THRESHOLD) artists[name].eliminated = true;
     }
     totalRated = savedRatings.length;
     updateStats();
