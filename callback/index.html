@@ -1070,10 +1070,23 @@ const TRACK_CACHE_TTL_HOURS = 168;
 async function fbGetTrackCache() {
   try {
     const doc = await db.collection('track_cache').doc(TRACK_CACHE_DOC).get();
-    if (!doc.exists) return null;
+    if (!doc.exists) {
+      // #region agent log
+      fetch('http://127.0.0.1:7242/ingest/71d6c798-9378-4e27-8468-570123fd153e',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({runId:DEBUG_RUN_ID,hypothesisId:'H8',location:'callback/index.html:fbGetTrackCache-miss',message:'Firestore track cache missing document',data:{docId:TRACK_CACHE_DOC},timestamp:Date.now()})}).catch(()=>{});
+      // #endregion
+      return null;
+    }
     const cache = doc.data();
     const ageHours = (Date.now() - (cache.updated_at?.toMillis() || 0)) / 3600000;
-    if (ageHours > TRACK_CACHE_TTL_HOURS) return null;
+    if (ageHours > TRACK_CACHE_TTL_HOURS) {
+      // #region agent log
+      fetch('http://127.0.0.1:7242/ingest/71d6c798-9378-4e27-8468-570123fd153e',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({runId:DEBUG_RUN_ID,hypothesisId:'H8',location:'callback/index.html:fbGetTrackCache-stale',message:'Firestore track cache stale',data:{docId:TRACK_CACHE_DOC,ageHours,ttlHours:TRACK_CACHE_TTL_HOURS},timestamp:Date.now()})}).catch(()=>{});
+      // #endregion
+      return null;
+    }
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/71d6c798-9378-4e27-8468-570123fd153e',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({runId:DEBUG_RUN_ID,hypothesisId:'H8',location:'callback/index.html:fbGetTrackCache-hit',message:'Firestore track cache hit',data:{docId:TRACK_CACHE_DOC,ageHours,artistCount:Object.keys(cache.data || {}).length},timestamp:Date.now()})}).catch(()=>{});
+    // #endregion
     return cache.data;
   } catch (e) {
     console.warn('Firestore track cache read failed:', e);
@@ -1088,6 +1101,9 @@ async function fbSaveTrackCache(data) {
       updated_at: firebase.firestore.FieldValue.serverTimestamp(),
       artist_count: Object.keys(data).length
     });
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/71d6c798-9378-4e27-8468-570123fd153e',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({runId:DEBUG_RUN_ID,hypothesisId:'H8',location:'callback/index.html:fbSaveTrackCache-success',message:'Firestore track cache write succeeded',data:{artistCount:Object.keys(data).length},timestamp:Date.now()})}).catch(()=>{});
+    // #endregion
   } catch (e) { console.warn('Firestore track cache save failed:', e); }
 }
 
@@ -1192,10 +1208,19 @@ const SPOTIFY_RETRY_MAX = 5;
 let apiDelayMs = 2000;
 const DEBUG_RUN_ID = `run_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 let globalRateLimitUntilMs = 0;
+let spotifyReqTimestamps = [];
 
 let isRefreshing = false;
 
 async function spotifyFetch(endpoint, options = {}, retriesLeft = SPOTIFY_RETRY_MAX) {
+  const now = Date.now();
+  spotifyReqTimestamps = spotifyReqTimestamps.filter(ts => now - ts < 30000);
+  spotifyReqTimestamps.push(now);
+  if (endpoint.includes('/search')) {
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/71d6c798-9378-4e27-8468-570123fd153e',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({runId:DEBUG_RUN_ID,hypothesisId:'H7',location:'callback/index.html:spotifyFetch-window',message:'Search request in rolling 30s window',data:{endpoint,retriesLeft,requestsInWindow30s:spotifyReqTimestamps.length,apiDelayMs,globalRateLimitUntilMs},timestamp:Date.now()})}).catch(()=>{});
+    // #endregion
+  }
   if (Date.now() < globalRateLimitUntilMs) {
     const gateWaitMs = globalRateLimitUntilMs - Date.now();
     // #region agent log
@@ -1381,9 +1406,6 @@ function loadCacheIntoState(cacheData, source) {
 }
 
 async function loadArtistTracksInBackground() {
-  // #region agent log
-  fetch('http://127.0.0.1:7242/ingest/71d6c798-9378-4e27-8468-570123fd153e',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({runId:DEBUG_RUN_ID,hypothesisId:'H1',location:'callback/index.html:loadArtistTracksInBackground-entry',message:'Background artist load entry',data:{loadingInBackgroundBefore:loadingInBackground,songQueueLength:songQueue.length,artistsTracked:Object.keys(artists).length},timestamp:Date.now()})}).catch(()=>{});
-  // #endregion
   loadingInBackground = true;
 
   // Priority 1: Firestore shared cache (one fetch serves all users)
