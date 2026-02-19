@@ -1291,7 +1291,7 @@ async function loadArtistTracksInBackground() {
 
     if (!firstSongPlayed && songQueue.length > 0) {
       firstSongPlayed = true;
-      playNext();
+      await playNext();
     }
 
     await sleep(450);
@@ -1330,6 +1330,15 @@ window.onSpotifyWebPlaybackSDKReady = () => { sdkReady = true; };
 
 function initWebPlayer() {
   return new Promise((resolve) => {
+    let resolved = false;
+    const timeout = setTimeout(() => {
+      if (!resolved) { resolved = true; console.warn('Web player timed out'); resolve(false); }
+    }, 10000);
+
+    function done(val) {
+      if (!resolved) { resolved = true; clearTimeout(timeout); resolve(val); }
+    }
+
     function tryInit() {
       if (!sdkReady) { setTimeout(tryInit, 200); return; }
       spotifyPlayer = new Spotify.Player({
@@ -1340,18 +1349,19 @@ function initWebPlayer() {
       spotifyPlayer.addListener('ready', ({ device_id }) => {
         deviceId = device_id;
         console.log('Web player ready, device:', device_id);
-        resolve(true);
+        done(true);
       });
       spotifyPlayer.addListener('not_ready', () => {
         console.warn('Web player went offline');
+        deviceId = null;
       });
       spotifyPlayer.addListener('initialization_error', ({ message }) => {
         console.error('SDK init error:', message);
-        resolve(false);
+        done(false);
       });
       spotifyPlayer.addListener('authentication_error', ({ message }) => {
         console.error('SDK auth error:', message);
-        resolve(false);
+        done(false);
       });
       spotifyPlayer.addListener('playback_error', ({ message }) => {
         console.error('SDK playback error:', message);
@@ -1372,7 +1382,23 @@ function initWebPlayer() {
 // ═══════════════════════════════════════════
 async function ensureDevice() {
   if (deviceId) return true;
-  // Fallback: check for external devices
+
+  // Try reconnecting the web player first
+  if (spotifyPlayer) {
+    try {
+      await spotifyPlayer.connect();
+      await sleep(1500);
+      if (deviceId) return true;
+    } catch (e) { console.warn('Web player reconnect failed:', e); }
+  }
+
+  // Fallback: try re-initializing the web player
+  if (!deviceId) {
+    const playerReady = await initWebPlayer();
+    if (playerReady && deviceId) return true;
+  }
+
+  // Last resort: check for external devices
   const devRes = await spotifyFetch('/me/player/devices');
   if (devRes && devRes.devices && devRes.devices.length > 0) {
     const active = devRes.devices.find(d => d.is_active);
