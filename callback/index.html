@@ -1191,10 +1191,18 @@ async function refreshAccessToken() {
 const SPOTIFY_RETRY_MAX = 5;
 let apiDelayMs = 2000;
 const DEBUG_RUN_ID = `run_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+let globalRateLimitUntilMs = 0;
 
 let isRefreshing = false;
 
 async function spotifyFetch(endpoint, options = {}, retriesLeft = SPOTIFY_RETRY_MAX) {
+  if (Date.now() < globalRateLimitUntilMs) {
+    const gateWaitMs = globalRateLimitUntilMs - Date.now();
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/71d6c798-9378-4e27-8468-570123fd153e',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({runId:DEBUG_RUN_ID,hypothesisId:'H6',location:'callback/index.html:rate-limit-gate',message:'Global rate limit gate delaying request',data:{endpoint,gateWaitMs,retriesLeft},timestamp:Date.now()})}).catch(()=>{});
+    // #endregion
+    await sleep(gateWaitMs);
+  }
   const url = endpoint.startsWith('http') ? endpoint : `https://api.spotify.com/v1${endpoint}`;
   const res = await fetch(url, {
     ...options,
@@ -1217,13 +1225,17 @@ async function spotifyFetch(endpoint, options = {}, retriesLeft = SPOTIFY_RETRY_
   if (res.status === 204 || res.status === 202) return {};
   if (res.status === 429 && retriesLeft > 0) {
     const retrySec = res.headers.get('Retry-After');
-    const waitMs = retrySec ? parseInt(retrySec, 10) * 1000 : 5000 * Math.pow(2, SPOTIFY_RETRY_MAX - retriesLeft);
+    const parsedRetrySec = retrySec ? parseInt(retrySec, 10) : NaN;
+    const hasRetryAfter = Number.isFinite(parsedRetrySec);
+    const waitMs = hasRetryAfter ? parsedRetrySec * 1000 : 5000 * Math.pow(2, SPOTIFY_RETRY_MAX - retriesLeft);
+    globalRateLimitUntilMs = Math.max(globalRateLimitUntilMs, Date.now() + waitMs);
     // #region agent log
     fetch('http://127.0.0.1:7242/ingest/71d6c798-9378-4e27-8468-570123fd153e',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({runId:DEBUG_RUN_ID,hypothesisId:'H2',location:'callback/index.html:429-branch',message:'Spotify 429 encountered',data:{endpoint,status:res.status,retriesLeft,retryAfterSec:retrySec,waitMs,apiDelayMsBefore:apiDelayMs},timestamp:Date.now()})}).catch(()=>{});
     // #endregion
     apiDelayMs = Math.min(apiDelayMs * 2, 8000);
     console.log(`Rate limited — waiting ${Math.round(waitMs/1000)}s (delay now ${apiDelayMs}ms)`);
     await sleep(waitMs);
+    if (!hasRetryAfter && retriesLeft < SPOTIFY_RETRY_MAX) return null;
     return spotifyFetch(endpoint, options, retriesLeft - 1);
   }
   if (res.status === 403) {
