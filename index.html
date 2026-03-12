@@ -872,7 +872,7 @@
         Finish & Create Playlist
       </button>
       <div style="font-size:0.75rem; color:rgba(255,255,255,0.3); margin-top:8px;">
-        Available after all artists have 3+ ratings
+        Available after all artists have 8 plays or are eliminated
       </div>
     </div>
   </div>
@@ -940,7 +940,26 @@ const SCOPES = [
 ].join(' ');
 
 const MIN_RATINGS = 3;
+const FINAL_LINEUP_RATINGS = 8;  // Round 2: each IN artist gets 8 total plays (including round 1's 3), then moves to final lineup
 const ELIMINATION_THRESHOLD = 3.0;
+
+// Round 1: still ranking (artists with < 3 ratings). Round 2: all artists ranked (IN or eliminated); only IN artists with < 8 plays stay in shuffle.
+function isRound2() {
+  return COACHELLA_ARTISTS.every(name => {
+    const a = artists[name];
+    return a && a.ratings && a.ratings.length >= MIN_RATINGS;
+  });
+}
+function artistInShuffle(name) {
+  const a = artists[name];
+  if (!a || !a.tracks || !a.tracks.length) return false;
+  if (isRound2()) return !a.eliminated && a.ratings.length < FINAL_LINEUP_RATINGS;
+  return a.ratings.length < MIN_RATINGS;
+}
+function trackAlreadyRated(artistName, trackId) {
+  const a = artists[artistName];
+  return a && a.ratings && a.ratings.some(r => r.trackId === trackId);
+}
 
 // ═══════════════════════════════════════════
 // COACHELLA 2026 LINEUP
@@ -1325,7 +1344,7 @@ async function initApp() {
       }));
       const avg = ratings.reduce((a, r) => a + r.score, 0) / ratings.length;
       artists[name].avgRating = Math.round(avg * 10) / 10;
-      if (ratings.length >= MIN_RATINGS && avg < ELIMINATION_THRESHOLD) artists[name].eliminated = true;
+      if (avg < ELIMINATION_THRESHOLD) artists[name].eliminated = true;
     }
     totalRated = savedRatings.length;
     updateStats();
@@ -1399,7 +1418,9 @@ function loadCacheIntoState(cacheData, source) {
       eliminated: existing.eliminated,
       avgRating: existing.avgRating
     };
+    if (!artistInShuffle(name)) { loaded++; continue; }
     for (const track of c.tracks) {
+      if (trackAlreadyRated(name, track.id)) continue;
       const pos = Math.floor(Math.random() * (songQueue.length + 1));
       songQueue.splice(pos, 0, { artist: name, track });
     }
@@ -1555,9 +1576,12 @@ async function loadArtistTracksInBackground() {
         avgRating: existing.avgRating
       };
 
-      for (const track of tracks) {
-        const pos = Math.floor(Math.random() * (songQueue.length + 1));
-        songQueue.splice(pos, 0, { artist: name, track });
+      if (artistInShuffle(name)) {
+        for (const track of tracks) {
+          if (trackAlreadyRated(name, track.id)) continue;
+          const pos = Math.floor(Math.random() * (songQueue.length + 1));
+          songQueue.splice(pos, 0, { artist: name, track });
+        }
       }
 
       loaded++;
@@ -1611,8 +1635,9 @@ async function loadArtistTracksInBackground() {
 function buildQueue() {
   songQueue = [];
   for (const [artistName, data] of Object.entries(artists)) {
-    if (data.eliminated) continue;
+    if (!artistInShuffle(artistName)) continue;
     for (const track of data.tracks) {
+      if (trackAlreadyRated(artistName, track.id)) continue;
       songQueue.push({ artist: artistName, track: track });
     }
   }
@@ -1747,14 +1772,21 @@ async function playNext() {
   if (window._trackEndFired) window._trackEndFired = false;
 
   try {
-    // Remove songs from eliminated artists
-    songQueue = songQueue.filter(s => !artists[s.artist]?.eliminated);
+    // Remove songs from artists that shouldn't be in shuffle (eliminated, or IN during round 1) or already rated
+    songQueue = songQueue.filter(s => {
+      if (!artistInShuffle(s.artist)) return false;
+      if (trackAlreadyRated(s.artist, s.track.id)) return false;
+      return true;
+    });
 
     if (songQueue.length === 0) {
-      // Rebuild queue from non-eliminated artists with unplayed or less-played tracks
       buildQueue();
       if (songQueue.length === 0) {
-        showToast('All songs have been played! Check your results.');
+        if (isRound2()) {
+          showToast('Round 2 complete! All songs from your IN artists have been played.');
+        } else {
+          showToast('All songs have been played! Check your results.');
+        }
         return;
       }
     }
@@ -1900,14 +1932,14 @@ function rate(score) {
 
   totalRated++;
 
-  // Check elimination
-  if (artistData.ratings.length >= MIN_RATINGS && !artistData.eliminated) {
-    if (artistData.avgRating < ELIMINATION_THRESHOLD) {
-      artistData.eliminated = true;
-      showToast(`❌ ${artistName} eliminated (avg: ${artistData.avgRating.toFixed(1)})`, 'eliminated-toast');
-    } else if (artistData.ratings.length === MIN_RATINGS) {
-      showToast(`✅ ${artistName} survives! (avg: ${artistData.avgRating.toFixed(1)})`, 'kept-toast');
-    }
+  // Eliminate at any point if average drops below 3
+  if (!artistData.eliminated && artistData.avgRating < ELIMINATION_THRESHOLD) {
+    artistData.eliminated = true;
+    showToast(`❌ ${artistName} eliminated (avg: ${artistData.avgRating.toFixed(1)})`, 'eliminated-toast');
+  } else if (!artistData.eliminated && artistData.ratings.length === MIN_RATINGS) {
+    showToast(`✅ ${artistName} survives! (avg: ${artistData.avgRating.toFixed(1)}) → Round 2`, 'kept-toast');
+  } else if (!artistData.eliminated && artistData.ratings.length === FINAL_LINEUP_RATINGS) {
+    showToast(`🏁 ${artistName} is in your final lineup! (avg: ${artistData.avgRating.toFixed(1)})`, 'kept-toast');
   }
 
   updateStats();
@@ -1942,9 +1974,9 @@ function updateStats() {
   document.getElementById('stat-eliminated').textContent = eliminated;
   document.getElementById('stat-rated').textContent = totalRated;
 
-  // Progress: based on how many artists have 3+ ratings
+  // Progress: artists either eliminated or in final lineup (8 plays)
   const total = Object.keys(artists).length;
-  const evaluated = Object.values(artists).filter(a => a.ratings.length >= MIN_RATINGS).length;
+  const evaluated = Object.values(artists).filter(a => a.eliminated || a.ratings.length >= FINAL_LINEUP_RATINGS).length;
   const pct = total > 0 ? (evaluated / total * 100) : 0;
   document.getElementById('progress-fill').style.width = pct + '%';
 }
@@ -1977,9 +2009,11 @@ function renderLeaderboards() {
 
 function renderRow(name, data, rank, isEliminated) {
   const statusClass = isEliminated ? 'eliminated' :
+    data.ratings.length >= FINAL_LINEUP_RATINGS ? 'kept' :
     data.ratings.length >= MIN_RATINGS ? 'kept' : 'pending';
   const statusText = isEliminated ? 'OUT' :
-    data.ratings.length >= MIN_RATINGS ? 'IN' : `${data.ratings.length}/${MIN_RATINGS}`;
+    data.ratings.length >= FINAL_LINEUP_RATINGS ? 'Final' :
+    data.ratings.length >= MIN_RATINGS ? `IN (${data.ratings.length}/${FINAL_LINEUP_RATINGS})` : `${data.ratings.length}/${MIN_RATINGS}`;
 
   return `
     <div class="lb-row ${isEliminated ? 'eliminated' : ''}">
@@ -2148,7 +2182,8 @@ async function showUserDetail(spotifyId) {
 
 function checkFinishEligibility() {
   const total = Object.keys(artists).length;
-  const evaluated = Object.values(artists).filter(a => a.ratings.length >= MIN_RATINGS || a.eliminated).length;
+  // Finish when every artist is either eliminated or has 8 plays (in final lineup)
+  const evaluated = Object.values(artists).filter(a => a.eliminated || a.ratings.length >= FINAL_LINEUP_RATINGS).length;
   const btn = document.getElementById('btn-finish');
   btn.disabled = evaluated < total;
 }
@@ -2160,8 +2195,9 @@ async function finishSession() {
   // Pause playback
   await spotifyFetch('/me/player/pause', { method: 'PUT' }).catch(() => {});
 
-  const survivors = Object.entries(artists)
-    .filter(([_, a]) => !a.eliminated)
+  // Final lineup: not eliminated and have 8 plays, ranked by average
+  const finalLineup = Object.entries(artists)
+    .filter(([_, a]) => !a.eliminated && a.ratings.length >= FINAL_LINEUP_RATINGS)
     .sort((a, b) => b[1].avgRating - a[1].avgRating);
 
   const eliminated = Object.entries(artists).filter(([_, a]) => a.eliminated);
@@ -2170,17 +2206,17 @@ async function finishSession() {
   document.getElementById('results-screen').style.display = 'block';
 
   document.getElementById('results-summary').textContent =
-    `${survivors.length} artists survived out of ${Object.keys(artists).length}. ${eliminated.length} eliminated.`;
+    `${finalLineup.length} artists in your final lineup (of ${Object.keys(artists).length}). ${eliminated.length} eliminated.`;
 
   document.getElementById('results-leaderboard').innerHTML =
-    survivors.map(([name, data], i) => renderRow(name, data, i + 1, false)).join('');
+    finalLineup.map(([name, data], i) => renderRow(name, data, i + 1, false)).join('');
 }
 
 async function createPlaylist() {
   showLoading('Creating your Coachella playlist...');
 
-  const survivors = Object.entries(artists)
-    .filter(([_, a]) => !a.eliminated)
+  const finalLineup = Object.entries(artists)
+    .filter(([_, a]) => !a.eliminated && a.ratings.length >= FINAL_LINEUP_RATINGS)
     .sort((a, b) => b[1].avgRating - a[1].avgRating);
 
   // Create playlist
@@ -2188,7 +2224,7 @@ async function createPlaylist() {
     method: 'POST',
     body: JSON.stringify({
       name: 'My Coachella 2026 Lineup 🌴',
-      description: `Curated by Vibe Code — ${survivors.length} artists, rated and approved.`,
+      description: `Curated by Vibe Code — ${finalLineup.length} artists, rated and approved.`,
       public: true
     })
   });
@@ -2199,9 +2235,9 @@ async function createPlaylist() {
     return;
   }
 
-  // Collect top-rated tracks from each surviving artist
+  // Collect top-rated tracks from each final-lineup artist
   const trackUris = [];
-  for (const [name, data] of survivors) {
+  for (const [name, data] of finalLineup) {
     // Get the highest-rated tracks for this artist
     const ratedTracks = data.ratings
       .sort((a, b) => b.score - a.score)
@@ -2237,12 +2273,33 @@ async function createPlaylist() {
   btn.onclick = () => window.open(playlist.external_urls?.spotify || 'https://open.spotify.com', '_blank');
 }
 
-function restartSession() {
+async function restartSession() {
   localStorage.removeItem('vibe_session');
-  artists = {};
-  totalRated = 0;
   songQueue = [];
   currentSong = null;
+  totalRated = 0;
+  // Keep "already played" from Firebase so we never replay those songs
+  artists = {};
+  if (userId) {
+    const savedRatings = await fbLoadUserRatings(userId);
+    if (savedRatings && savedRatings.length > 0) {
+      const ratingsByArtist = {};
+      for (const r of savedRatings) {
+        if (!ratingsByArtist[r.artist_name]) ratingsByArtist[r.artist_name] = [];
+        ratingsByArtist[r.artist_name].push(r);
+      }
+      for (const [name, ratings] of Object.entries(ratingsByArtist)) {
+        artists[name] = {
+          spotifyId: '',
+          tracks: [],
+          ratings: ratings.map(r => ({ trackId: r.track_id, trackName: r.track_name, score: r.score })),
+          eliminated: false,
+          avgRating: 0
+        };
+      }
+      totalRated = savedRatings.length;
+    }
+  }
   document.getElementById('results-screen').style.display = 'none';
   document.getElementById('player-section').style.display = 'block';
   loadArtistTracksInBackground();
