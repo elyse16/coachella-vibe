@@ -961,6 +961,17 @@ function trackAlreadyRated(artistName, trackId) {
   return a && a.ratings && a.ratings.some(r => r.trackId === trackId);
 }
 
+// Remove any queued songs that shouldn't be in shuffle (e.g. artist just hit 3 plays in round 1). Call after state changes.
+function purgeQueueIneligible() {
+  const before = songQueue.length;
+  songQueue = songQueue.filter(s => {
+    if (trackAlreadyRated(s.artist, s.track.id)) return false;
+    if (!artistInShuffle(s.artist)) return false;
+    return true;
+  });
+  if (songQueue.length < before) saveSession();
+}
+
 // ═══════════════════════════════════════════
 // COACHELLA 2026 LINEUP
 // ═══════════════════════════════════════════
@@ -1369,6 +1380,7 @@ async function initApp() {
       artists = session.artists;
       totalRated = session.totalRated;
       songQueue = session.songQueue || [];
+      purgeQueueIneligible(); // drop any songs from artists who already have 3+ plays (round 1 done)
       if (songQueue.length === 0) buildQueue();
       updateStats();
       renderLeaderboards();
@@ -1791,6 +1803,15 @@ async function playNext() {
       }
     }
 
+    // Safety: drop any ineligible songs at the front (e.g. artist just hit 3 in round 1)
+    while (songQueue.length > 0 && (!artistInShuffle(songQueue[0].artist) || trackAlreadyRated(songQueue[0].artist, songQueue[0].track.id))) {
+      songQueue.shift();
+    }
+    if (songQueue.length === 0) {
+      buildQueue();
+      if (songQueue.length === 0) return;
+    }
+
     if (currentSong) {
       playedHistory.push(currentSong);
       if (playedHistory.length > PLAYED_HISTORY_MAX) playedHistory.shift();
@@ -1947,12 +1968,16 @@ function rate(score) {
   checkFinishEligibility();
   saveSession();
 
-  // Auto-advance after brief delay (cancel any previous pending advance)
+  // Purge queue so artists with 3+ plays (round 1 done) don't appear until round 2
+  purgeQueueIneligible();
+
+  // Auto-advance: sooner when artist just hit 3 (round 1 done) so we don't linger on that screen
+  const delayMs = (!artistData.eliminated && artistData.ratings.length === MIN_RATINGS) ? 400 : 800;
   if (window._ratingAdvanceTimeout) clearTimeout(window._ratingAdvanceTimeout);
   window._ratingAdvanceTimeout = setTimeout(() => {
     window._ratingAdvanceTimeout = null;
     playNext();
-  }, 800);
+  }, delayMs);
 }
 
 function skipSong() {
