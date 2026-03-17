@@ -961,6 +961,24 @@ function trackAlreadyRated(artistName, trackId) {
   return a && a.ratings && a.ratings.some(r => r.trackId === trackId);
 }
 
+function ratingCount(a) {
+  return (a && Array.isArray(a.ratings) ? a.ratings.length : 0);
+}
+
+// Round 1 rule: you need 3 songs before we can eliminate. Un-eliminate anyone who was marked eliminated with < 3 ratings.
+function fixRound1Elimination() {
+  let changed = false;
+  for (const name of Object.keys(artists)) {
+    const a = artists[name];
+    if (!a || !a.eliminated) continue;
+    if (ratingCount(a) < MIN_RATINGS) {
+      a.eliminated = false;
+      changed = true;
+    }
+  }
+  if (changed) saveSession(); // persist so next refresh loads corrected state
+}
+
 // Remove any queued songs that shouldn't be in shuffle (e.g. artist just hit 3 plays in round 1). Call after state changes.
 function purgeQueueIneligible() {
   const before = songQueue.length;
@@ -1355,8 +1373,9 @@ async function initApp() {
       }));
       const avg = ratings.reduce((a, r) => a + r.score, 0) / ratings.length;
       artists[name].avgRating = Math.round(avg * 10) / 10;
-      if (avg < ELIMINATION_THRESHOLD) artists[name].eliminated = true;
+      if (ratings.length >= MIN_RATINGS && avg < ELIMINATION_THRESHOLD) artists[name].eliminated = true;
     }
+    fixRound1Elimination(); // pull back anyone eliminated with < 3 ratings
     totalRated = savedRatings.length;
     updateStats();
     renderLeaderboards();
@@ -1380,6 +1399,7 @@ async function initApp() {
       artists = session.artists;
       totalRated = session.totalRated;
       songQueue = session.songQueue || [];
+      fixRound1Elimination(); // pull back anyone eliminated with < 3 ratings
       purgeQueueIneligible(); // drop any songs from artists who already have 3+ plays (round 1 done)
       if (songQueue.length === 0) buildQueue();
       updateStats();
@@ -1440,6 +1460,7 @@ function loadCacheIntoState(cacheData, source) {
     document.getElementById('progress-fill').style.width =
       ((loaded / COACHELLA_ARTISTS.length) * 100) + '%';
   }
+  fixRound1Elimination(); // after merging cache, pull back anyone eliminated with < 3 ratings
   console.log(`Loaded ${loaded} artists from ${source}`);
   return loaded;
 }
@@ -1953,8 +1974,8 @@ function rate(score) {
 
   totalRated++;
 
-  // Eliminate at any point if average drops below 3
-  if (!artistData.eliminated && artistData.avgRating < ELIMINATION_THRESHOLD) {
+  // Eliminate only after 3 songs in round 1, or in round 2 if avg drops below 3
+  if (!artistData.eliminated && artistData.ratings.length >= MIN_RATINGS && artistData.avgRating < ELIMINATION_THRESHOLD) {
     artistData.eliminated = true;
     showToast(`❌ ${artistName} eliminated (avg: ${artistData.avgRating.toFixed(1)})`, 'eliminated-toast');
   } else if (!artistData.eliminated && artistData.ratings.length === MIN_RATINGS) {
@@ -1992,28 +2013,33 @@ function skipSong() {
 // STATS & UI
 // ═══════════════════════════════════════════
 function updateStats() {
-  const active = Object.values(artists).filter(a => !a.eliminated).length;
-  const eliminated = Object.values(artists).filter(a => a.eliminated).length;
+  fixRound1Elimination(); // ensure no one is eliminated with < 3 ratings
+  const isEliminated = (a) => a.eliminated && ratingCount(a) >= MIN_RATINGS;
+  const active = Object.values(artists).filter(a => !isEliminated(a)).length;
+  const eliminated = Object.values(artists).filter(isEliminated).length;
 
   document.getElementById('stat-remaining').textContent = active;
   document.getElementById('stat-eliminated').textContent = eliminated;
   document.getElementById('stat-rated').textContent = totalRated;
 
-  // Progress: artists either eliminated or in final lineup (8 plays)
+  // Progress: artists either eliminated (with 3+ ratings) or in final lineup (8 plays)
   const total = Object.keys(artists).length;
-  const evaluated = Object.values(artists).filter(a => a.eliminated || a.ratings.length >= FINAL_LINEUP_RATINGS).length;
+  const evaluated = Object.values(artists).filter(a => isEliminated(a) || ratingCount(a) >= FINAL_LINEUP_RATINGS).length;
   const pct = total > 0 ? (evaluated / total * 100) : 0;
   document.getElementById('progress-fill').style.width = pct + '%';
 }
 
 function renderLeaderboards() {
-  // Active artists sorted by avg rating desc
+  fixRound1Elimination(); // ensure eliminated list is correct before painting
+  // Only show as eliminated if they have 3+ ratings (round 1 rule)
+  const canBeEliminated = ([_, a]) => a.eliminated && ratingCount(a) >= MIN_RATINGS;
+  // Active: not eliminated, or eliminated but < 3 ratings (still in round 1)
   const activeArtists = Object.entries(artists)
-    .filter(([_, a]) => !a.eliminated)
+    .filter(([_, a]) => !canBeEliminated([_, a]))
     .sort((a, b) => b[1].avgRating - a[1].avgRating || b[1].ratings.length - a[1].ratings.length);
 
   const eliminatedArtists = Object.entries(artists)
-    .filter(([_, a]) => a.eliminated)
+    .filter(canBeEliminated)
     .sort((a, b) => b[1].avgRating - a[1].avgRating);
 
   const allArtists = Object.entries(artists)
@@ -2028,7 +2054,7 @@ function renderLeaderboards() {
     : '<div style="text-align:center;color:rgba(255,255,255,0.3);padding:30px;">No artists eliminated yet</div>';
 
   document.getElementById('leaderboard-all').innerHTML = allArtists.map(([name, data], i) =>
-    renderRow(name, data, i + 1, data.eliminated)
+    renderRow(name, data, i + 1, canBeEliminated([name, data]))
   ).join('');
 }
 
