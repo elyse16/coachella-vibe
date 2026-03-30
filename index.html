@@ -1115,7 +1115,8 @@ async function fbLoadAllUsers() {
 // ═══════════════════════════════════════════
 // FIRESTORE TRACK CACHE (shared across all users)
 // ═══════════════════════════════════════════
-const TRACK_CACHE_DOC = 'coachella_2026';
+const TRACK_CACHE_DOC = 'coachella_2026_v2';
+const TRACK_CACHE_LS_KEY = 'track_cache_v2';
 const TRACK_CACHE_TTL_HOURS = 168;
 const MIN_CACHE_ARTISTS = Math.max(20, Math.floor(COACHELLA_ARTISTS.length * 0.6));
 
@@ -1129,6 +1130,19 @@ function countArtistsWithTracks(cacheData) {
 
 function isUsableTrackCache(cacheData) {
   return countArtistsWithTracks(cacheData) >= MIN_CACHE_ARTISTS;
+}
+
+function normalizeArtistName(name) {
+  return (name || '')
+    .toString()
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function trackHasExactArtist(track, artistName) {
+  const target = normalizeArtistName(artistName);
+  return (track?.artists || []).some(a => normalizeArtistName(a?.name) === target);
 }
 
 async function fbGetTrackCache() {
@@ -1422,18 +1436,18 @@ async function initApp() {
 
 function getTrackCache() {
   try {
-    const raw = localStorage.getItem('track_cache');
+    const raw = localStorage.getItem(TRACK_CACHE_LS_KEY);
     if (!raw) return null;
     const cache = JSON.parse(raw);
     const ageHours = (Date.now() - (cache.ts || 0)) / 3600000;
-    if (ageHours > 24) { localStorage.removeItem('track_cache'); return null; }
+    if (ageHours > 24) { localStorage.removeItem(TRACK_CACHE_LS_KEY); return null; }
     return cache.data;
   } catch { return null; }
 }
 
 function saveTrackCache(data) {
   try {
-    localStorage.setItem('track_cache', JSON.stringify({ ts: Date.now(), data }));
+    localStorage.setItem(TRACK_CACHE_LS_KEY, JSON.stringify({ ts: Date.now(), data }));
   } catch { /* storage full */ }
 }
 
@@ -1475,7 +1489,7 @@ function chunkArray(items, size) {
 
 async function fetchTracksForArtistBatch(artistNames) {
   const lowered = new Set(artistNames.map(n => n.toLowerCase()));
-  const query = artistNames.map(n => `artist:${n}`).join(' OR ');
+  const query = artistNames.map(n => `artist:"${n.replace(/"/g, '')}"`).join(' OR ');
   const searchRes = await spotifyFetch(
     `/search?q=${encodeURIComponent(query)}&type=track&limit=50`
   );
@@ -1487,10 +1501,11 @@ async function fetchTracksForArtistBatch(artistNames) {
     for (const name of artistNames) {
       if (spotifyRateLimitTriggered) break;
       const single = await spotifyFetch(
-        `/search?q=${encodeURIComponent('artist:' + name)}&type=track&limit=10`
+        `/search?q=${encodeURIComponent(`artist:"${name.replace(/"/g, '')}"`)}&type=track&limit=20`
       );
       if (!single || !single.tracks || !single.tracks.items || !single.tracks.items.length) continue;
-      grouped[name] = single.tracks.items.slice(0, 10).map(t => ({
+      const exactItems = single.tracks.items.filter(t => trackHasExactArtist(t, name));
+      grouped[name] = exactItems.slice(0, 10).map(t => ({
         id: t.id,
         uri: t.uri,
         name: t.name,
@@ -1560,7 +1575,7 @@ async function loadArtistTracksInBackground() {
     return;
   } else if (lsCached) {
     console.warn(`Ignoring incomplete local cache (${countArtistsWithTracks(lsCached)} artists)`);
-    localStorage.removeItem('track_cache');
+    localStorage.removeItem(TRACK_CACHE_LS_KEY);
   }
 
   // Priority 3: Fresh fetch from Spotify API
