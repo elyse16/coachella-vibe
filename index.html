@@ -1145,6 +1145,22 @@ function trackHasExactArtist(track, artistName) {
   return (track?.artists || []).some(a => normalizeArtistName(a?.name) === target);
 }
 
+// When Spotify’s credited name differs slightly (punctuation / casing), still prefer lineup match
+function artistCreditsMatchLineup(apiName, lineupName) {
+  const a = normalizeArtistName(apiName);
+  const b = normalizeArtistName(lineupName);
+  if (a === b) return true;
+  const strip = s => s.replace(/[^a-z0-9]+/g, '');
+  const sa = strip(a);
+  const sb = strip(b);
+  if (sa.length >= 4 && sb.length >= 4 && sa === sb) return true;
+  return false;
+}
+
+function trackHasMatchingArtist(track, lineupName) {
+  return (track?.artists || []).some(a => artistCreditsMatchLineup(a?.name, lineupName));
+}
+
 async function fbGetTrackCache() {
   try {
     const doc = await db.collection('track_cache').doc(TRACK_CACHE_DOC).get();
@@ -1487,40 +1503,61 @@ function chunkArray(items, size) {
   return chunks;
 }
 
+function spotifyArtistSearchQuery(artistName) {
+  const n = (artistName || '').replace(/"/g, '');
+  // Quoted form helps names with & or punctuation; unquoted OR batch is more reliable for bulk search
+  if (/[&]/.test(n) || /[^\w\s\-.'’]/.test(n)) return `artist:"${n}"`;
+  return `artist:${n}`;
+}
+
 async function fetchTracksForArtistBatch(artistNames) {
   const lowered = new Set(artistNames.map(n => n.toLowerCase()));
-  const query = artistNames.map(n => `artist:"${n.replace(/"/g, '')}"`).join(' OR ');
+  const query = artistNames.map(n => spotifyArtistSearchQuery(n)).join(' OR ');
   const searchRes = await spotifyFetch(
     `/search?q=${encodeURIComponent(query)}&type=track&limit=50`
   );
 
   const grouped = {};
   for (const name of artistNames) grouped[name] = [];
-  if (!searchRes || !searchRes.tracks || !searchRes.tracks.items) {
-    if (spotifyRateLimitTriggered) return grouped;
+
+  const items = searchRes?.tracks?.items;
+  const batchEmpty = !searchRes || !searchRes.tracks || !Array.isArray(items) || items.length === 0;
+
+  async function fetchPerArtistFallback() {
+    if (spotifyRateLimitTriggered) return;
     for (const name of artistNames) {
       if (spotifyRateLimitTriggered) break;
       const single = await spotifyFetch(
-        `/search?q=${encodeURIComponent(`artist:"${name.replace(/"/g, '')}"`)}&type=track&limit=20`
+        `/search?q=${encodeURIComponent(spotifyArtistSearchQuery(name))}&type=track&limit=20`
       );
       if (!single || !single.tracks || !single.tracks.items || !single.tracks.items.length) continue;
-      const exactItems = single.tracks.items.filter(t => trackHasExactArtist(t, name));
-      grouped[name] = exactItems.slice(0, 10).map(t => ({
-        id: t.id,
-        uri: t.uri,
-        name: t.name,
-        album: t.album?.name || '',
-        art: t.album?.images?.[0]?.url || '',
-        duration_ms: t.duration_ms,
-        _artistId: t.artists?.[0]?.id || ''
-      }));
+      let picked = single.tracks.items.filter(t => trackHasExactArtist(t, name));
+      if (!picked.length) picked = single.tracks.items.filter(t => trackHasMatchingArtist(t, name));
+      if (!picked.length) continue;
+      grouped[name] = picked.slice(0, 10).map(t => {
+        const matchArtist = (t.artists || []).find(a => artistCreditsMatchLineup(a?.name, name));
+        const cred = matchArtist || t.artists?.[0];
+        return {
+          id: t.id,
+          uri: t.uri,
+          name: t.name,
+          album: t.album?.name || '',
+          art: t.album?.images?.[0]?.url || '',
+          duration_ms: t.duration_ms,
+          _artistId: cred?.id || t.artists?.[0]?.id || ''
+        };
+      });
     }
+  }
+
+  if (batchEmpty) {
+    await fetchPerArtistFallback();
     return grouped;
   }
 
-  for (const t of searchRes.tracks.items) {
+  for (const t of items) {
     for (const a of (t.artists || [])) {
-      const matchedName = artistNames.find(n => n.toLowerCase() === (a.name || '').toLowerCase());
+      const matchedName = artistNames.find(n => artistCreditsMatchLineup(a.name, n));
       if (!matchedName) continue;
       if (grouped[matchedName].length >= 10) continue;
       grouped[matchedName].push({
@@ -1534,6 +1571,12 @@ async function fetchTracksForArtistBatch(artistNames) {
       });
       if (grouped[matchedName].length >= 10 && lowered.size === 1) break;
     }
+  }
+
+  const totalInBatch = artistNames.reduce((s, n) => s + grouped[n].length, 0);
+  if (totalInBatch === 0) {
+    for (const name of artistNames) grouped[name] = [];
+    await fetchPerArtistFallback();
   }
 
   return grouped;
