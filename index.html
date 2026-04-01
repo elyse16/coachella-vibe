@@ -1081,8 +1081,12 @@ async function fbSaveRating(spotifyId, artistName, trackId, trackName, score) {
 
 async function fbLoadUserRatings(spotifyId) {
   try {
-    const snap = await db.collection('ratings')
-      .where('spotify_id', '==', spotifyId).get();
+    const snap = await withTimeout(
+      db.collection('ratings').where('spotify_id', '==', spotifyId).get(),
+      15000,
+      null
+    );
+    if (!snap || !snap.docs) return [];
     return snap.docs.map(d => d.data());
   } catch (e) {
     console.warn('Firebase load ratings failed:', e);
@@ -1163,8 +1167,12 @@ function trackHasMatchingArtist(track, lineupName) {
 
 async function fbGetTrackCache() {
   try {
-    const doc = await db.collection('track_cache').doc(TRACK_CACHE_DOC).get();
-    if (!doc.exists) return null;
+    const doc = await withTimeout(
+      db.collection('track_cache').doc(TRACK_CACHE_DOC).get(),
+      15000,
+      null
+    );
+    if (!doc || !doc.exists) return null;
     const cache = doc.data();
     const ageHours = (Date.now() - (cache.updated_at?.toMillis() || 0)) / 3600000;
     if (ageHours > TRACK_CACHE_TTL_HOURS) return null;
@@ -1357,8 +1365,9 @@ async function initApp() {
   document.getElementById('login-screen').style.display = 'none';
   document.getElementById('player-section').style.display = 'block';
 
+  try {
   const me = await spotifyFetch('/me');
-  if (!me) { hideLoading(); return; }
+  if (!me) return;
   userId = me.id;
   userDisplayName = me.display_name || me.id;
   userAvatar = (me.images && me.images.length > 0) ? me.images[0].url : '';
@@ -1407,7 +1416,6 @@ async function initApp() {
     updateStats();
     renderLeaderboards();
     checkFinishEligibility();
-    hideLoading();
     // Still load tracks in background for playback
     loadArtistTracksInBackground();
     return;
@@ -1432,7 +1440,6 @@ async function initApp() {
       updateStats();
       renderLeaderboards();
       checkFinishEligibility();
-      hideLoading();
       playNext();
       return;
       }
@@ -1443,8 +1450,13 @@ async function initApp() {
   }
 
   // No saved session: start loading artists in the background
-  hideLoading();
   loadArtistTracksInBackground();
+  } catch (e) {
+    console.error('initApp failed:', e);
+    showError('Something went wrong starting the app. Please refresh and try again.');
+  } finally {
+    hideLoading();
+  }
 }
 
 function getTrackCache() {
@@ -1630,7 +1642,8 @@ async function loadArtistTracksInBackground() {
   const artistBatches = chunkArray(COACHELLA_ARTISTS, ARTIST_SEARCH_BATCH_SIZE);
   for (const batch of artistBatches) {
     if (spotifyRateLimitTriggered) {
-      const cool = Math.max(0, globalRateLimitUntilMs - Date.now()) + 5000;
+      const rawCool = Math.max(0, globalRateLimitUntilMs - Date.now()) + 5000;
+      const cool = Math.min(rawCool, 120000);
       showToast(`Rate limited — pausing ${Math.round(cool / 1000)}s before continuing…`, 'eliminated-toast');
       await sleep(cool);
       spotifyRateLimitTriggered = false;
@@ -1716,6 +1729,10 @@ async function loadArtistTracksInBackground() {
   loadingInBackground = false;
   checkFinishEligibility();
   saveSession();
+  if (!firstSongPlayed && songQueue.length === 0 && successfulLoads > 0) {
+    buildQueue();
+    if (songQueue.length > 0) await playNext();
+  }
   if (successfulLoads === COACHELLA_ARTISTS.length) {
     showToast(`All ${successfulLoads} artists loaded!`, 'kept-toast');
   } else if (successfulLoads > 0) {
@@ -1743,6 +1760,13 @@ function buildQueue() {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
+function withTimeout(promise, ms, fallback) {
+  return Promise.race([
+    promise,
+    sleep(ms).then(() => fallback)
+  ]);
+}
+
 // ═══════════════════════════════════════════
 // WEB PLAYBACK SDK (in-browser player)
 // ═══════════════════════════════════════════
@@ -1756,15 +1780,22 @@ window.onSpotifyWebPlaybackSDKReady = () => { sdkReady = true; };
 function initWebPlayer() {
   return new Promise((resolve) => {
     let resolved = false;
+    let giveUp = false;
     const timeout = setTimeout(() => {
-      if (!resolved) { resolved = true; console.warn('Web player timed out'); resolve(false); }
-    }, 10000);
+      if (!resolved) {
+        resolved = true;
+        giveUp = true;
+        console.warn('Web player timed out');
+        resolve(false);
+      }
+    }, 12000);
 
     function done(val) {
-      if (!resolved) { resolved = true; clearTimeout(timeout); resolve(val); }
+      if (!resolved) { resolved = true; giveUp = true; clearTimeout(timeout); resolve(val); }
     }
 
     function tryInit() {
+      if (giveUp) return;
       if (!sdkReady) { setTimeout(tryInit, 200); return; }
       spotifyPlayer = new Spotify.Player({
         name: 'Coachella Vibe',
