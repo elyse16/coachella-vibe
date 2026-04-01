@@ -1302,20 +1302,38 @@ const MIN_SEARCH_SPACING_MS = 8000;
 
 let isRefreshing = false;
 
+const SPOTIFY_FETCH_TIMEOUT_MS = 28000;
+
 async function spotifyFetch(endpoint, options = {}, retriesLeft = SPOTIFY_RETRY_MAX) {
   const now = Date.now();
   if (now < globalRateLimitUntilMs) {
     await sleep(globalRateLimitUntilMs - now);
   }
   const url = endpoint.startsWith('http') ? endpoint : `https://api.spotify.com/v1${endpoint}`;
-  const res = await fetch(url, {
-    ...options,
-    headers: {
-      'Authorization': `Bearer ${accessToken}`,
-      'Content-Type': 'application/json',
-      ...options.headers
+  const ctrl = new AbortController();
+  const to = setTimeout(() => ctrl.abort(), SPOTIFY_FETCH_TIMEOUT_MS);
+  let res;
+  try {
+    res = await fetch(url, {
+      ...options,
+      signal: ctrl.signal,
+      headers: {
+        'Authorization': `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+        ...options.headers
+      }
+    });
+  } catch (e) {
+    clearTimeout(to);
+    if (e && e.name === 'AbortError') {
+      console.error('Spotify request timed out:', endpoint);
+      showToast('Spotify request timed out — check your connection and refresh.', 'eliminated-toast');
+      return null;
     }
-  });
+    console.error('Spotify fetch failed:', endpoint, e);
+    return null;
+  }
+  clearTimeout(to);
   if (res.status === 401 && !isRefreshing) {
     isRefreshing = true;
     const refreshed = await refreshAccessToken();
@@ -1375,24 +1393,14 @@ async function initApp() {
 
   fbUpsertUser(userId, userDisplayName, userAvatar, userEmail);
 
-  // Start in-browser Spotify player (skip in embedded browsers without DRM support)
-  if (isEmbeddedBrowser) {
-    webPlayerUnsupported = true;
-    console.warn('Embedded browser detected, skipping Spotify Web Playback SDK');
-    showError('Embedded browser detected. For full playback support, open in Chrome or Safari.');
-  } else {
-    showLoading('Starting Spotify player...');
-    const playerReady = await initWebPlayer();
-    if (!playerReady) {
-      await ensureDevice();
-    }
-  }
-
-  // Try restoring from Firebase first, then local storage fallback
+  // Restore Firebase / session BEFORE Web Playback SDK — SDK connect() can hang; that must not block hideLoading()
   showLoading('Restoring your ratings...');
   const savedRatings = await fbLoadUserRatings(userId);
+  let hadFirebaseRatings = false;
+  let sessionRestored = false;
+
   if (savedRatings && savedRatings.length > 0) {
-    // Rebuild artist state from Firebase ratings
+    hadFirebaseRatings = true;
     const ratingsByArtist = {};
     for (const r of savedRatings) {
       if (!ratingsByArtist[r.artist_name]) ratingsByArtist[r.artist_name] = [];
@@ -1411,45 +1419,58 @@ async function initApp() {
       artists[name].avgRating = Math.round(avg * 10) / 10;
       if (ratings.length >= MIN_RATINGS && avg < ELIMINATION_THRESHOLD) artists[name].eliminated = true;
     }
-    fixRound1Elimination(); // pull back anyone eliminated with < 3 ratings
+    fixRound1Elimination();
     totalRated = savedRatings.length;
     updateStats();
     renderLeaderboards();
     checkFinishEligibility();
-    // Still load tracks in background for playback
-    loadArtistTracksInBackground();
-    return;
-  }
-
-  // Local storage fallback
-  const saved = localStorage.getItem('vibe_session');
-  if (saved) {
-    try {
-      const session = JSON.parse(saved);
-      const savedArtistCount = countArtistsWithTracks(session.artists);
-      if (savedArtistCount < MIN_CACHE_ARTISTS) {
-        console.warn(`Ignoring incomplete saved session (${savedArtistCount} artists)`);
+  } else {
+    const saved = localStorage.getItem('vibe_session');
+    if (saved) {
+      try {
+        const session = JSON.parse(saved);
+        const savedArtistCount = countArtistsWithTracks(session.artists);
+        if (savedArtistCount < MIN_CACHE_ARTISTS) {
+          console.warn(`Ignoring incomplete saved session (${savedArtistCount} artists)`);
+          localStorage.removeItem('vibe_session');
+        } else {
+          artists = session.artists;
+          totalRated = session.totalRated;
+          songQueue = session.songQueue || [];
+          fixRound1Elimination();
+          purgeQueueIneligible();
+          if (songQueue.length === 0) buildQueue();
+          updateStats();
+          renderLeaderboards();
+          checkFinishEligibility();
+          sessionRestored = true;
+        }
+      } catch (e) {
+        console.log('Could not restore session, starting fresh');
         localStorage.removeItem('vibe_session');
-      } else {
-      artists = session.artists;
-      totalRated = session.totalRated;
-      songQueue = session.songQueue || [];
-      fixRound1Elimination(); // pull back anyone eliminated with < 3 ratings
-      purgeQueueIneligible(); // drop any songs from artists who already have 3+ plays (round 1 done)
-      if (songQueue.length === 0) buildQueue();
-      updateStats();
-      renderLeaderboards();
-      checkFinishEligibility();
-      playNext();
-      return;
       }
-    } catch(e) {
-      console.log('Could not restore session, starting fresh');
-      localStorage.removeItem('vibe_session');
     }
   }
 
-  // No saved session: start loading artists in the background
+  hideLoading();
+
+  if (isEmbeddedBrowser) {
+    webPlayerUnsupported = true;
+    console.warn('Embedded browser detected, skipping Spotify Web Playback SDK');
+    showError('Embedded browser detected. For full playback support, open in Chrome or Safari.');
+  } else {
+    const playerReady = await initWebPlayer();
+    if (!playerReady) await ensureDevice();
+  }
+
+  if (hadFirebaseRatings) {
+    loadArtistTracksInBackground();
+    return;
+  }
+  if (sessionRestored) {
+    playNext();
+    return;
+  }
   loadArtistTracksInBackground();
   } catch (e) {
     console.error('initApp failed:', e);
@@ -1847,6 +1868,27 @@ function initWebPlayer() {
 // ═══════════════════════════════════════════
 // DEVICE MANAGEMENT
 // ═══════════════════════════════════════════
+const PLAYER_CONNECT_TIMEOUT_MS = 15000;
+const CONNECT_TIMED_OUT = {};
+
+async function playerConnectWithTimeout(player) {
+  if (!player || typeof player.connect !== 'function') return false;
+  try {
+    const result = await Promise.race([
+      player.connect(),
+      sleep(PLAYER_CONNECT_TIMEOUT_MS).then(() => CONNECT_TIMED_OUT)
+    ]);
+    if (result === CONNECT_TIMED_OUT) {
+      console.warn('Spotify player.connect() timed out');
+      return false;
+    }
+    return result !== false;
+  } catch (e) {
+    console.warn('Spotify player.connect() failed:', e);
+    return false;
+  }
+}
+
 async function ensureDevice() {
   if (deviceId) return true;
 
@@ -1854,7 +1896,7 @@ async function ensureDevice() {
     // Try reconnecting the web player first
     if (spotifyPlayer) {
       try {
-        await spotifyPlayer.connect();
+        await playerConnectWithTimeout(spotifyPlayer);
         await sleep(1500);
         if (deviceId) return true;
       } catch (e) { console.warn('Web player reconnect failed:', e); }
