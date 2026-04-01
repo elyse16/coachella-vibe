@@ -1290,7 +1290,7 @@ const ARTIST_SEARCH_BATCH_SIZE = 8;
 const INITIAL_ARTIST_LOAD_COUNT = 20;
 const SUBSEQUENT_STAGE_ARTIST_COUNT = 24;
 const STAGE_DELAY_MS = 30000;
-const MIN_SEARCH_SPACING_MS = 6000;
+const MIN_SEARCH_SPACING_MS = 8000;
 
 let isRefreshing = false;
 
@@ -1331,9 +1331,6 @@ async function spotifyFetch(endpoint, options = {}, retriesLeft = SPOTIFY_RETRY_
     const waitSec = Math.round(waitMs / 1000);
     console.log(`Rate limited — waiting ${waitSec}s (delay now ${apiDelayMs}ms)`);
     showToast(`Spotify rate limited — retrying in ${waitSec}s…`, 'eliminated-toast');
-    // Search is the hottest endpoint; fail fast and let outer flow cool down.
-    if (endpoint.includes('/search')) return null;
-    // Honor Retry-After/global gate before retrying non-search calls.
     await sleep(waitMs);
     return spotifyFetch(endpoint, options, retriesLeft - 1);
   }
@@ -1524,9 +1521,9 @@ async function fetchTracksForArtistBatch(artistNames) {
   const batchEmpty = !searchRes || !searchRes.tracks || !Array.isArray(items) || items.length === 0;
 
   async function fetchPerArtistFallback() {
-    if (spotifyRateLimitTriggered) return;
-    for (const name of artistNames) {
-      if (spotifyRateLimitTriggered) break;
+    for (let i = 0; i < artistNames.length; i++) {
+      const name = artistNames[i];
+      if (i > 0) await sleep(Math.max(apiDelayMs, MIN_SEARCH_SPACING_MS));
       const single = await spotifyFetch(
         `/search?q=${encodeURIComponent(spotifyArtistSearchQuery(name))}&type=track&limit=20`
       );
@@ -1632,7 +1629,12 @@ async function loadArtistTracksInBackground() {
 
   const artistBatches = chunkArray(COACHELLA_ARTISTS, ARTIST_SEARCH_BATCH_SIZE);
   for (const batch of artistBatches) {
-    if (spotifyRateLimitTriggered) break;
+    if (spotifyRateLimitTriggered) {
+      const cool = Math.max(0, globalRateLimitUntilMs - Date.now()) + 5000;
+      showToast(`Rate limited — pausing ${Math.round(cool / 1000)}s before continuing…`, 'eliminated-toast');
+      await sleep(cool);
+      spotifyRateLimitTriggered = false;
+    }
     if (consecutiveFailures >= 5) {
       showToast('Too many API failures. Using partial data.', 'eliminated-toast');
       break;
