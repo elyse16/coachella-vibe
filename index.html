@@ -947,29 +947,55 @@ const ELIMINATION_THRESHOLD = 3.0;
 function isRound2() {
   if (!COACHELLA_ARTISTS.length) return false;
   return COACHELLA_ARTISTS.every(lineupName => {
-    const a = getArtistState(lineupName);
-    if (!a || !Array.isArray(a.tracks) || a.tracks.length === 0) return false;
-    return ratingCount(a) >= MIN_RATINGS;
+    const nk = artistNormKey(lineupName);
+    const tracks = bestTracksArrayForNorm(nk);
+    if (!tracks || !tracks.length) return false;
+    return unionRatingsCountForNorm(nk) >= MIN_RATINGS;
   });
 }
+// Distinct tracks this user has rated or already heard (skip / advance) — robust when ratings and tracks lived on duplicate `artists` keys.
+function uniqueHeardTrackCount(a) {
+  if (!a) return 0;
+  const s = new Set();
+  for (const r of (a.ratings || [])) {
+    const tid = r.trackId || r.track_id;
+    if (tid) s.add(tid);
+  }
+  for (const id of (a.playedTrackIds || [])) {
+    if (id) s.add(id);
+  }
+  return s.size;
+}
+
 function artistInShuffle(name) {
-  const a = getArtistState(name);
-  if (!a || !a.tracks || !a.tracks.length) return false;
-  if (isRound2()) return !a.eliminated && ratingCount(a) < FINAL_LINEUP_RATINGS;
-  return ratingCount(a) < MIN_RATINGS;
+  const nk = artistNormKey(name);
+  const tracks = bestTracksArrayForNorm(nk);
+  if (!tracks || !tracks.length) return false;
+  const ratedN = unionRatingsCountForNorm(nk);
+  if (isRound2()) return !anyEliminatedForNorm(nk) && ratedN < FINAL_LINEUP_RATINGS;
+  return ratedN < MIN_RATINGS;
 }
 function trackAlreadyRated(artistName, trackId) {
-  const a = getArtistState(artistName);
-  if (!a || !Array.isArray(a.ratings)) return false;
-  return a.ratings.some(r => (r.trackId || r.track_id) === trackId);
+  const nk = artistNormKey(artistName);
+  for (const k of Object.keys(artists)) {
+    if (normalizeArtistName(k) !== nk) continue;
+    const a = artists[k];
+    if (!a || !Array.isArray(a.ratings)) continue;
+    if (a.ratings.some(r => (r.trackId || r.track_id) === trackId)) return true;
+  }
+  return false;
 }
 
 // Heard or rated — skips and completed listens count; queue must not repeat the same track per artist.
 function trackAlreadyPlayed(artistName, trackId) {
   if (trackAlreadyRated(artistName, trackId)) return true;
-  const a = getArtistState(artistName);
-  if (!a || !Array.isArray(a.playedTrackIds)) return false;
-  return a.playedTrackIds.includes(trackId);
+  const nk = artistNormKey(artistName);
+  for (const k of Object.keys(artists)) {
+    if (normalizeArtistName(k) !== nk) continue;
+    const a = artists[k];
+    if (a && Array.isArray(a.playedTrackIds) && a.playedTrackIds.includes(trackId)) return true;
+  }
+  return false;
 }
 
 function recordTrackPlayed(artistName, trackId) {
@@ -992,7 +1018,7 @@ function fixRound1Elimination() {
   for (const name of Object.keys(artists)) {
     const a = artists[name];
     if (!a || !a.eliminated) continue;
-    if (ratingCount(a) < MIN_RATINGS) {
+    if (unionRatingsCountForNorm(artistNormKey(name)) < MIN_RATINGS) {
       a.eliminated = false;
       changed = true;
     }
@@ -1176,42 +1202,191 @@ function lineupKeyForStoredArtistName(name) {
   return found || raw || name;
 }
 
-// Prefer the key that already holds state in `artists`, else official lineup spelling.
+// Single normalized key for one festival act (handles aliases). Shuffle + caps scan ALL `artists` rows matching this.
+function artistNormKey(name) {
+  const raw = String(name || '').trim().replace(/\u00a0/g, ' ');
+  const n = normalizeArtistName(raw);
+  const lineupExact = COACHELLA_ARTISTS.find(ln => normalizeArtistName(ln) === n);
+  return normalizeArtistName(lineupExact || raw);
+}
+
+function forEachArtistRowMatchingNorm(normKey, fn) {
+  for (const k of Object.keys(artists)) {
+    if (normalizeArtistName(k) !== normKey) continue;
+    const row = artists[k];
+    if (row) fn(row, k);
+  }
+}
+
+function unionRatingsCountForNorm(normKey) {
+  const ids = new Set();
+  forEachArtistRowMatchingNorm(normKey, (a) => {
+    for (const r of (a.ratings || [])) {
+      const tid = r.trackId || r.track_id;
+      if (tid) ids.add(tid);
+    }
+  });
+  return ids.size;
+}
+
+function avgRatingForNorm(normKey) {
+  const byTrack = new Map();
+  forEachArtistRowMatchingNorm(normKey, (a) => {
+    for (const r of (a.ratings || [])) {
+      const tid = r.trackId || r.track_id;
+      if (tid != null && tid !== '' && !byTrack.has(tid)) byTrack.set(tid, r.score);
+    }
+  });
+  if (!byTrack.size) return 0;
+  let s = 0;
+  for (const v of byTrack.values()) s += v;
+  return s / byTrack.size;
+}
+
+function bestTracksArrayForNorm(normKey) {
+  let best = null;
+  let bestLen = 0;
+  forEachArtistRowMatchingNorm(normKey, (a) => {
+    const t = a.tracks;
+    const len = Array.isArray(t) ? t.length : 0;
+    if (len > bestLen) {
+      bestLen = len;
+      best = t;
+    }
+  });
+  return best;
+}
+
+function anyEliminatedForNorm(normKey) {
+  let e = false;
+  forEachArtistRowMatchingNorm(normKey, (a) => {
+    if (a.eliminated) e = true;
+  });
+  return e;
+}
+
+// Prefer official lineup spelling when the act is on the poster (avoids duplicate `artists` keys).
 function resolveLineupArtistKey(name) {
   if (name == null || name === '') return name;
-  if (artists[name]) return name;
   const raw = String(name).trim().replace(/\u00a0/g, ' ');
-  if (artists[raw]) return raw;
   const n = normalizeArtistName(raw);
-  const found = COACHELLA_ARTISTS.find(ln => normalizeArtistName(ln) === n);
-  if (found) return found;
-  for (const k of Object.keys(artists)) {
-    if (normalizeArtistName(k) === n) return k;
+  const lineupExact = COACHELLA_ARTISTS.find(ln => normalizeArtistName(ln) === n);
+  if (lineupExact) return lineupExact;
+
+  if (artists[name]) return name;
+  if (artists[raw]) return raw;
+  const keys = Object.keys(artists).filter(k => normalizeArtistName(k) === n);
+  if (keys.length === 1) return keys[0];
+  if (keys.length > 1) {
+    return keys.reduce((best, k) =>
+      ratingCount(artists[k]) > ratingCount(artists[best]) ? k : best
+    );
   }
   return raw || name;
 }
 
+// Merge duplicate `artists` keys that normalize to the same name (Firebase vs cache vs Spotify casing).
 function getArtistState(name) {
-  const canonical = resolveLineupArtistKey(name);
-  if (artists[canonical]) return artists[canonical];
-  const n = normalizeArtistName(canonical);
-  for (const lineupName of COACHELLA_ARTISTS) {
-    if (normalizeArtistName(lineupName) === n && artists[lineupName]) return artists[lineupName];
-  }
+  const raw = String(name || '').trim().replace(/\u00a0/g, ' ');
+  const n = normalizeArtistName(raw);
+  const candidateKeys = new Set();
+  const lineupExact = COACHELLA_ARTISTS.find(ln => normalizeArtistName(ln) === n);
+  if (lineupExact && artists[lineupExact]) candidateKeys.add(lineupExact);
+  if (artists[raw]) candidateKeys.add(raw);
+  if (name != null && artists[name]) candidateKeys.add(name);
   for (const k of Object.keys(artists)) {
-    if (normalizeArtistName(k) === n) return artists[k];
+    if (normalizeArtistName(k) === n) candidateKeys.add(k);
   }
-  return null;
+  const states = [...candidateKeys].map(k => artists[k]).filter(Boolean);
+  if (!states.length) return null;
+  if (states.length === 1) return states[0];
+  return states.reduce((best, a) => {
+    const bt = (best.tracks || []).length;
+    const at = (a.tracks || []).length;
+    if (at > 0 && bt === 0) return a;
+    if (bt > 0 && at === 0) return best;
+    const br = ratingCount(best);
+    const ar = ratingCount(a);
+    if (ar !== br) return ar > br ? a : best;
+    const bu = uniqueHeardTrackCount(best);
+    const au = uniqueHeardTrackCount(a);
+    if (au !== bu) return au > bu ? a : best;
+    return a;
+  });
+}
+
+// Merge Firebase / session / Spotify casing aliases into one row per act (official lineup key when on poster).
+function consolidateDuplicateArtistKeys() {
+  const byNorm = new Map();
+  for (const k of Object.keys(artists)) {
+    const n = normalizeArtistName(k);
+    if (!byNorm.has(n)) byNorm.set(n, []);
+    byNorm.get(n).push(k);
+  }
+  for (const [, keys] of byNorm) {
+    if (keys.length < 2) continue;
+    const n0 = normalizeArtistName(keys[0]);
+    const lineupKey = COACHELLA_ARTISTS.find(ln => normalizeArtistName(ln) === n0);
+    const target = lineupKey || keys.reduce((a, b) =>
+      ratingCount(artists[b]) > ratingCount(artists[a]) ? b : a
+    );
+    const merged = {
+      spotifyId: '',
+      tracks: [],
+      ratings: [],
+      playedTrackIds: [],
+      eliminated: false,
+      avgRating: 0
+    };
+    for (const k of keys) {
+      const cur = artists[k];
+      if (!cur) continue;
+      if ((cur.tracks || []).length > (merged.tracks || []).length) {
+        merged.tracks = Array.isArray(cur.tracks) ? cur.tracks.slice() : [];
+        merged.spotifyId = cur.spotifyId || merged.spotifyId;
+      }
+      const seen = new Set((merged.ratings || []).map(r => r.trackId || r.track_id));
+      for (const r of (cur.ratings || [])) {
+        const tid = r.trackId || r.track_id;
+        if (!tid || seen.has(tid)) continue;
+        merged.ratings.push({
+          trackId: tid,
+          trackName: r.trackName || r.track_name || '',
+          score: r.score
+        });
+        seen.add(tid);
+      }
+      const ps = new Set(merged.playedTrackIds || []);
+      for (const id of (cur.playedTrackIds || [])) {
+        if (id) ps.add(id);
+      }
+      merged.playedTrackIds = [...ps];
+      merged.eliminated = !!(merged.eliminated || cur.eliminated);
+    }
+    for (const k of keys) {
+      delete artists[k];
+    }
+    const len = merged.ratings.length;
+    merged.avgRating = len
+      ? Math.round((merged.ratings.reduce((a, r) => a + r.score, 0) / len) * 10) / 10
+      : 0;
+    if (!Array.isArray(merged.playedTrackIds)) merged.playedTrackIds = [];
+    artists[target] = merged;
+  }
 }
 
 function getArtistRecordKey(name) {
   const st = getArtistState(name);
-  if (st) {
-    for (const k of Object.keys(artists)) {
-      if (artists[k] === st) return k;
-    }
-  }
-  return resolveLineupArtistKey(name);
+  if (!st) return resolveLineupArtistKey(name);
+  const raw = String(name || '').trim().replace(/\u00a0/g, ' ');
+  const n = normalizeArtistName(raw);
+  const lineupExact = COACHELLA_ARTISTS.find(ln => normalizeArtistName(ln) === n);
+  const keys = Object.keys(artists).filter(k => artists[k] === st);
+  if (!keys.length) return resolveLineupArtistKey(name);
+  if (lineupExact && keys.includes(lineupExact)) return lineupExact;
+  return keys.reduce((best, k) =>
+    ratingCount(artists[k]) > ratingCount(artists[best]) ? k : best
+  );
 }
 
 function dedupeRatingsByTrackId(ratingDocs) {
@@ -1503,6 +1678,7 @@ async function initApp() {
       if (rlen >= MIN_RATINGS && avg < ELIMINATION_THRESHOLD) artists[name].eliminated = true;
       if (!Array.isArray(artists[name].playedTrackIds)) artists[name].playedTrackIds = [];
     }
+    consolidateDuplicateArtistKeys();
     fixRound1Elimination();
     totalRated = savedRatings.length;
     updateStats();
@@ -1528,6 +1704,7 @@ async function initApp() {
               artist: resolveLineupArtistKey(h.artist)
             }));
           }
+          consolidateDuplicateArtistKeys();
           fixRound1Elimination();
           purgeQueueIneligible();
           if (songQueue.length === 0) buildQueue();
@@ -1612,6 +1789,7 @@ function loadCacheIntoState(cacheData, source) {
     document.getElementById('progress-fill').style.width =
       ((loaded / COACHELLA_ARTISTS.length) * 100) + '%';
   }
+  consolidateDuplicateArtistKeys();
   fixRound1Elimination(); // after merging cache, pull back anyone eliminated with < 3 ratings
   purgeQueueIneligible(); // drop queued songs for artists already done with round 1 (or round 2 done)
   console.log(`Loaded ${loaded} artists from ${source}`);
@@ -1835,6 +2013,8 @@ async function loadArtistTracksInBackground() {
     }
   }
 
+  consolidateDuplicateArtistKeys();
+
   if (isUsableTrackCache(trackData)) {
     saveTrackCache(trackData);
     fbSaveTrackCache(trackData);
@@ -1859,11 +2039,14 @@ async function loadArtistTracksInBackground() {
 
 function buildQueue() {
   songQueue = [];
-  for (const [artistName, data] of Object.entries(artists)) {
+  // One entry per festival act — never Object.entries(artists), or duplicate keys (e.g. casing) bypass round 1 caps.
+  for (const artistName of COACHELLA_ARTISTS) {
+    const data = getArtistState(artistName);
+    if (!data || !data.tracks || !data.tracks.length) continue;
     if (!artistInShuffle(artistName)) continue;
     for (const track of data.tracks) {
       if (trackAlreadyPlayed(artistName, track.id)) continue;
-      songQueue.push({ artist: artistName, track: track });
+      songQueue.push({ artist: artistName, track });
     }
   }
   // Shuffle
@@ -2103,13 +2286,12 @@ function updateNowPlaying() {
   document.getElementById('np-track').textContent = currentSong.track.name;
   document.getElementById('np-artist').textContent = lineupKeyForStoredArtistName(currentSong.artist);
 
-  const artistData = getArtistState(currentSong.artist);
-  if (artistData) {
-    const count = ratingCount(artistData);
-    document.getElementById('np-count').textContent =
-      count === 0 ? 'First song from this artist' :
-      `${count} song${count > 1 ? 's' : ''} rated · avg ${artistData.avgRating.toFixed(1)}`;
-  }
+  const nk = artistNormKey(currentSong.artist);
+  const count = unionRatingsCountForNorm(nk);
+  const avgVal = avgRatingForNorm(nk);
+  document.getElementById('np-count').textContent =
+    count === 0 ? 'First song from this artist' :
+    `${count} song${count > 1 ? 's' : ''} rated · avg ${avgVal.toFixed(1)}`;
 
   // Reset star highlights
   document.querySelectorAll('.star-btn').forEach(b => b.classList.remove('active'));
@@ -2601,6 +2783,7 @@ async function restartSession() {
       totalRated = savedRatings.length;
     }
   }
+  consolidateDuplicateArtistKeys();
   document.getElementById('results-screen').style.display = 'none';
   document.getElementById('player-section').style.display = 'block';
   loadArtistTracksInBackground();
