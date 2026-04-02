@@ -945,21 +945,41 @@ const ELIMINATION_THRESHOLD = 3.0;
 
 // Round 1: still ranking (artists with < 3 ratings). Round 2: full lineup has tracks AND everyone has 3+ ratings; only IN artists with < 8 plays stay in shuffle.
 function isRound2() {
-  return COACHELLA_ARTISTS.every(name => {
-    const a = artists[name];
+  if (!COACHELLA_ARTISTS.length) return false;
+  return COACHELLA_ARTISTS.every(lineupName => {
+    const a = getArtistState(lineupName);
     if (!a || !Array.isArray(a.tracks) || a.tracks.length === 0) return false;
     return ratingCount(a) >= MIN_RATINGS;
   });
 }
 function artistInShuffle(name) {
-  const a = artists[name];
+  const a = getArtistState(name);
   if (!a || !a.tracks || !a.tracks.length) return false;
   if (isRound2()) return !a.eliminated && ratingCount(a) < FINAL_LINEUP_RATINGS;
   return ratingCount(a) < MIN_RATINGS;
 }
 function trackAlreadyRated(artistName, trackId) {
-  const a = artists[artistName];
-  return a && a.ratings && a.ratings.some(r => r.trackId === trackId);
+  const a = getArtistState(artistName);
+  if (!a || !Array.isArray(a.ratings)) return false;
+  return a.ratings.some(r => (r.trackId || r.track_id) === trackId);
+}
+
+// Heard or rated — skips and completed listens count; queue must not repeat the same track per artist.
+function trackAlreadyPlayed(artistName, trackId) {
+  if (trackAlreadyRated(artistName, trackId)) return true;
+  const a = getArtistState(artistName);
+  if (!a || !Array.isArray(a.playedTrackIds)) return false;
+  return a.playedTrackIds.includes(trackId);
+}
+
+function recordTrackPlayed(artistName, trackId) {
+  if (!trackId) return;
+  const key = getArtistRecordKey(artistName);
+  const a = artists[key];
+  if (!a) return;
+  if (!Array.isArray(a.playedTrackIds)) a.playedTrackIds = [];
+  if (a.playedTrackIds.includes(trackId)) return;
+  a.playedTrackIds.push(trackId);
 }
 
 function ratingCount(a) {
@@ -983,11 +1003,13 @@ function fixRound1Elimination() {
 // Remove any queued songs that shouldn't be in shuffle (e.g. artist just hit 3 plays in round 1). Call after state changes.
 function purgeQueueIneligible() {
   const before = songQueue.length;
-  songQueue = songQueue.filter(s => {
-    if (trackAlreadyRated(s.artist, s.track.id)) return false;
-    if (!artistInShuffle(s.artist)) return false;
-    return true;
-  });
+  songQueue = songQueue
+    .map(s => ({ ...s, artist: resolveLineupArtistKey(s.artist) }))
+    .filter(s => {
+      if (trackAlreadyPlayed(s.artist, s.track.id)) return false;
+      if (!artistInShuffle(s.artist)) return false;
+      return true;
+    });
   if (songQueue.length < before) saveSession();
 }
 
@@ -1140,9 +1162,66 @@ function isUsableTrackCache(cacheData) {
 function normalizeArtistName(name) {
   return (name || '')
     .toString()
+    .replace(/\u00a0/g, ' ')
     .toLowerCase()
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+// Map stored / API strings to the official lineup key (no `artists` lookup — safe for Firebase grouping).
+function lineupKeyForStoredArtistName(name) {
+  const raw = String(name || '').trim().replace(/\u00a0/g, ' ');
+  const n = normalizeArtistName(raw);
+  const found = COACHELLA_ARTISTS.find(ln => normalizeArtistName(ln) === n);
+  return found || raw || name;
+}
+
+// Prefer the key that already holds state in `artists`, else official lineup spelling.
+function resolveLineupArtistKey(name) {
+  if (name == null || name === '') return name;
+  if (artists[name]) return name;
+  const raw = String(name).trim().replace(/\u00a0/g, ' ');
+  if (artists[raw]) return raw;
+  const n = normalizeArtistName(raw);
+  const found = COACHELLA_ARTISTS.find(ln => normalizeArtistName(ln) === n);
+  if (found) return found;
+  for (const k of Object.keys(artists)) {
+    if (normalizeArtistName(k) === n) return k;
+  }
+  return raw || name;
+}
+
+function getArtistState(name) {
+  const canonical = resolveLineupArtistKey(name);
+  if (artists[canonical]) return artists[canonical];
+  const n = normalizeArtistName(canonical);
+  for (const lineupName of COACHELLA_ARTISTS) {
+    if (normalizeArtistName(lineupName) === n && artists[lineupName]) return artists[lineupName];
+  }
+  for (const k of Object.keys(artists)) {
+    if (normalizeArtistName(k) === n) return artists[k];
+  }
+  return null;
+}
+
+function getArtistRecordKey(name) {
+  const st = getArtistState(name);
+  if (st) {
+    for (const k of Object.keys(artists)) {
+      if (artists[k] === st) return k;
+    }
+  }
+  return resolveLineupArtistKey(name);
+}
+
+function dedupeRatingsByTrackId(ratingDocs) {
+  const seen = new Map();
+  for (const r of ratingDocs) {
+    const tid = r.track_id || r.trackId;
+    if (tid == null || tid === '') continue;
+    if (!seen.has(tid)) seen.set(tid, r);
+  }
+  return Array.from(seen.values());
 }
 
 function trackHasExactArtist(track, artistName) {
@@ -1404,21 +1483,25 @@ async function initApp() {
     hadFirebaseRatings = true;
     const ratingsByArtist = {};
     for (const r of savedRatings) {
-      if (!ratingsByArtist[r.artist_name]) ratingsByArtist[r.artist_name] = [];
-      ratingsByArtist[r.artist_name].push(r);
+      const key = lineupKeyForStoredArtistName(r.artist_name);
+      if (!ratingsByArtist[key]) ratingsByArtist[key] = [];
+      ratingsByArtist[key].push(r);
     }
     for (const [name, ratings] of Object.entries(ratingsByArtist)) {
+      const uniq = dedupeRatingsByTrackId(ratings);
       if (!artists[name]) {
-        artists[name] = { spotifyId: '', tracks: [], ratings: [], eliminated: false, avgRating: 0 };
+        artists[name] = { spotifyId: '', tracks: [], ratings: [], playedTrackIds: [], eliminated: false, avgRating: 0 };
       }
-      artists[name].ratings = ratings.map(r => ({
-        trackId: r.track_id,
-        trackName: r.track_name,
+      artists[name].ratings = uniq.map(r => ({
+        trackId: r.track_id || r.trackId,
+        trackName: r.track_name || r.trackName || '',
         score: r.score
       }));
-      const avg = ratings.reduce((a, r) => a + r.score, 0) / ratings.length;
+      const rlen = artists[name].ratings.length;
+      const avg = rlen ? artists[name].ratings.reduce((a, x) => a + x.score, 0) / rlen : 0;
       artists[name].avgRating = Math.round(avg * 10) / 10;
-      if (ratings.length >= MIN_RATINGS && avg < ELIMINATION_THRESHOLD) artists[name].eliminated = true;
+      if (rlen >= MIN_RATINGS && avg < ELIMINATION_THRESHOLD) artists[name].eliminated = true;
+      if (!Array.isArray(artists[name].playedTrackIds)) artists[name].playedTrackIds = [];
     }
     fixRound1Elimination();
     totalRated = savedRatings.length;
@@ -1438,6 +1521,13 @@ async function initApp() {
           artists = session.artists;
           totalRated = session.totalRated;
           songQueue = session.songQueue || [];
+          playedHistory = (session.playedHistory || []).slice(-PLAYED_HISTORY_MAX);
+          if (playedHistory.length) {
+            playedHistory = playedHistory.map(h => ({
+              ...h,
+              artist: resolveLineupArtistKey(h.artist)
+            }));
+          }
           fixRound1Elimination();
           purgeQueueIneligible();
           if (songQueue.length === 0) buildQueue();
@@ -1503,17 +1593,18 @@ function loadCacheIntoState(cacheData, source) {
   for (const name of COACHELLA_ARTISTS) {
     const c = cacheData[name];
     if (!c || !c.tracks || !c.tracks.length) { loaded++; continue; }
-    const existing = artists[name] || { ratings: [], eliminated: false, avgRating: 0 };
+    const existing = artists[name] || { ratings: [], playedTrackIds: [], eliminated: false, avgRating: 0 };
     artists[name] = {
       spotifyId: c.spotifyId,
       tracks: c.tracks,
       ratings: existing.ratings,
+      playedTrackIds: Array.isArray(existing.playedTrackIds) ? existing.playedTrackIds : [],
       eliminated: existing.eliminated,
       avgRating: existing.avgRating
     };
     if (!artistInShuffle(name)) { loaded++; continue; }
     for (const track of c.tracks) {
-      if (trackAlreadyRated(name, track.id)) continue;
+      if (trackAlreadyPlayed(name, track.id)) continue;
       const pos = Math.floor(Math.random() * (songQueue.length + 1));
       songQueue.splice(pos, 0, { artist: name, track });
     }
@@ -1696,18 +1787,19 @@ async function loadArtistTracksInBackground() {
 
       trackData[name] = { spotifyId: spotId, tracks };
 
-      const existing = artists[name] || { ratings: [], eliminated: false, avgRating: 0 };
+      const existing = artists[name] || { ratings: [], playedTrackIds: [], eliminated: false, avgRating: 0 };
       artists[name] = {
         spotifyId: spotId,
         tracks,
         ratings: existing.ratings,
+        playedTrackIds: Array.isArray(existing.playedTrackIds) ? existing.playedTrackIds : [],
         eliminated: existing.eliminated,
         avgRating: existing.avgRating
       };
 
       if (artistInShuffle(name)) {
         for (const track of tracks) {
-          if (trackAlreadyRated(name, track.id)) continue;
+          if (trackAlreadyPlayed(name, track.id)) continue;
           const pos = Math.floor(Math.random() * (songQueue.length + 1));
           songQueue.splice(pos, 0, { artist: name, track });
         }
@@ -1770,7 +1862,7 @@ function buildQueue() {
   for (const [artistName, data] of Object.entries(artists)) {
     if (!artistInShuffle(artistName)) continue;
     for (const track of data.tracks) {
-      if (trackAlreadyRated(artistName, track.id)) continue;
+      if (trackAlreadyPlayed(artistName, track.id)) continue;
       songQueue.push({ artist: artistName, track: track });
     }
   }
@@ -1940,12 +2032,14 @@ async function playNext() {
   if (window._trackEndFired) window._trackEndFired = false;
 
   try {
-    // Remove songs from artists that shouldn't be in shuffle (eliminated, or IN during round 1) or already rated
-    songQueue = songQueue.filter(s => {
-      if (!artistInShuffle(s.artist)) return false;
-      if (trackAlreadyRated(s.artist, s.track.id)) return false;
-      return true;
-    });
+    // Remove songs from artists that shouldn't be in shuffle (eliminated, or IN during round 1) or already heard
+    songQueue = songQueue
+      .map(s => ({ ...s, artist: resolveLineupArtistKey(s.artist) }))
+      .filter(s => {
+        if (!artistInShuffle(s.artist)) return false;
+        if (trackAlreadyPlayed(s.artist, s.track.id)) return false;
+        return true;
+      });
 
     if (songQueue.length === 0) {
       buildQueue();
@@ -1960,7 +2054,7 @@ async function playNext() {
     }
 
     // Safety: drop any ineligible songs at the front (e.g. artist just hit 3 in round 1)
-    while (songQueue.length > 0 && (!artistInShuffle(songQueue[0].artist) || trackAlreadyRated(songQueue[0].artist, songQueue[0].track.id))) {
+    while (songQueue.length > 0 && (!artistInShuffle(songQueue[0].artist) || trackAlreadyPlayed(songQueue[0].artist, songQueue[0].track.id))) {
       songQueue.shift();
     }
     if (songQueue.length === 0) {
@@ -1969,10 +2063,12 @@ async function playNext() {
     }
 
     if (currentSong) {
+      recordTrackPlayed(currentSong.artist, currentSong.track.id);
       playedHistory.push(currentSong);
       if (playedHistory.length > PLAYED_HISTORY_MAX) playedHistory.shift();
     }
     currentSong = songQueue.shift();
+    if (currentSong) currentSong.artist = resolveLineupArtistKey(currentSong.artist);
     updateNowPlaying();
 
     // Play on Spotify
@@ -1993,6 +2089,7 @@ async function playNext() {
     }
   } finally {
     playNextInProgress = false;
+    saveSession(); // keep playedHistory + queue in sync so Previous survives refresh / reload
     if (playNextPending) {
       playNextPending = false;
       setTimeout(() => playNext(), 0);
@@ -2004,11 +2101,11 @@ function updateNowPlaying() {
   if (!currentSong) return;
   document.getElementById('np-art').src = currentSong.track.art || '';
   document.getElementById('np-track').textContent = currentSong.track.name;
-  document.getElementById('np-artist').textContent = currentSong.artist;
+  document.getElementById('np-artist').textContent = lineupKeyForStoredArtistName(currentSong.artist);
 
-  const artistData = artists[currentSong.artist];
+  const artistData = getArtistState(currentSong.artist);
   if (artistData) {
-    const count = artistData.ratings.length;
+    const count = ratingCount(artistData);
     document.getElementById('np-count').textContent =
       count === 0 ? 'First song from this artist' :
       `${count} song${count > 1 ? 's' : ''} rated · avg ${artistData.avgRating.toFixed(1)}`;
@@ -2054,6 +2151,7 @@ async function previousTrack() {
     // Go back one song: put current at front of queue, pop last from history, play it
     if (currentSong) songQueue.unshift(currentSong);
     currentSong = playedHistory.pop();
+    if (currentSong) currentSong.artist = resolveLineupArtistKey(currentSong.artist);
     updateNowPlaying();
     const hasDevice = await ensureDevice();
     if (hasDevice) {
@@ -2066,12 +2164,23 @@ async function previousTrack() {
       hideError();
     }
   } else if (currentSong) {
-    // No history: restart current track from the beginning
-    await ensureDevice();
-    await spotifyFetch(`/me/player/play?device_id=${deviceId}`, {
-      method: 'PUT',
-      body: JSON.stringify({ uris: [currentSong.track.uri] })
-    });
+    // No in-app history (e.g. fresh load): try Spotify's previous, then fall back to restarting this URI
+    const hasDevice = await ensureDevice();
+    if (!hasDevice) return;
+    const prevRes = await spotifyFetch(
+      `/me/player/previous?device_id=${encodeURIComponent(deviceId)}`,
+      { method: 'POST' }
+    );
+    if (prevRes === null) {
+      await spotifyFetch(`/me/player/play?device_id=${deviceId}`, {
+        method: 'PUT',
+        body: JSON.stringify({ uris: [currentSong.track.uri] })
+      });
+    } else {
+      isPlaying = true;
+      updatePlayPauseIcon();
+      hideError();
+    }
   }
 }
 
@@ -2081,7 +2190,7 @@ async function previousTrack() {
 function rate(score) {
   if (!currentSong) return;
 
-  const artistName = currentSong.artist;
+  const artistName = getArtistRecordKey(currentSong.artist);
   const artistData = artists[artistName];
   if (!artistData) return;
 
@@ -2100,7 +2209,7 @@ function rate(score) {
 
   // Persist to Firebase (fire-and-forget)
   if (userId) {
-    fbSaveRating(userId, artistName, ratingObj.trackId, ratingObj.trackName, score);
+    fbSaveRating(userId, lineupKeyForStoredArtistName(artistName), ratingObj.trackId, ratingObj.trackName, score);
   }
 
   // Recalculate average
@@ -2472,16 +2581,21 @@ async function restartSession() {
     if (savedRatings && savedRatings.length > 0) {
       const ratingsByArtist = {};
       for (const r of savedRatings) {
-        if (!ratingsByArtist[r.artist_name]) ratingsByArtist[r.artist_name] = [];
-        ratingsByArtist[r.artist_name].push(r);
+        const key = lineupKeyForStoredArtistName(r.artist_name);
+        if (!ratingsByArtist[key]) ratingsByArtist[key] = [];
+        ratingsByArtist[key].push(r);
       }
       for (const [name, ratings] of Object.entries(ratingsByArtist)) {
+        const uniq = dedupeRatingsByTrackId(ratings);
+        const mapped = uniq.map(r => ({ trackId: r.track_id || r.trackId, trackName: r.track_name || r.trackName || '', score: r.score }));
+        const avg = mapped.length ? mapped.reduce((a, x) => a + x.score, 0) / mapped.length : 0;
         artists[name] = {
           spotifyId: '',
           tracks: [],
-          ratings: ratings.map(r => ({ trackId: r.track_id, trackName: r.track_name, score: r.score })),
+          ratings: mapped,
+          playedTrackIds: [],
           eliminated: false,
-          avgRating: 0
+          avgRating: Math.round(avg * 10) / 10
         };
       }
       totalRated = savedRatings.length;
@@ -2500,7 +2614,8 @@ function saveSession() {
     localStorage.setItem('vibe_session', JSON.stringify({
       artists: artists,
       totalRated: totalRated,
-      songQueue: songQueue.slice(0, 50) // Only save next 50 to save space
+      songQueue: songQueue.slice(0, 50), // Only save next 50 to save space
+      playedHistory: playedHistory.slice(-PLAYED_HISTORY_MAX)
     }));
   } catch(e) {
     console.warn('Could not save session:', e);
