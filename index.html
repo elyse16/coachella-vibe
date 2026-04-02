@@ -943,18 +943,19 @@ const MIN_RATINGS = 3;
 const FINAL_LINEUP_RATINGS = 8;  // Round 2: each IN artist gets 8 total plays (including round 1's 3), then moves to final lineup
 const ELIMINATION_THRESHOLD = 3.0;
 
-// Round 1: still ranking (artists with < 3 ratings). Round 2: all artists ranked (IN or eliminated); only IN artists with < 8 plays stay in shuffle.
+// Round 1: still ranking (artists with < 3 ratings). Round 2: full lineup has tracks AND everyone has 3+ ratings; only IN artists with < 8 plays stay in shuffle.
 function isRound2() {
   return COACHELLA_ARTISTS.every(name => {
     const a = artists[name];
-    return a && a.ratings && a.ratings.length >= MIN_RATINGS;
+    if (!a || !Array.isArray(a.tracks) || a.tracks.length === 0) return false;
+    return ratingCount(a) >= MIN_RATINGS;
   });
 }
 function artistInShuffle(name) {
   const a = artists[name];
   if (!a || !a.tracks || !a.tracks.length) return false;
-  if (isRound2()) return !a.eliminated && a.ratings.length < FINAL_LINEUP_RATINGS;
-  return a.ratings.length < MIN_RATINGS;
+  if (isRound2()) return !a.eliminated && ratingCount(a) < FINAL_LINEUP_RATINGS;
+  return ratingCount(a) < MIN_RATINGS;
 }
 function trackAlreadyRated(artistName, trackId) {
   const a = artists[artistName];
@@ -1521,6 +1522,7 @@ function loadCacheIntoState(cacheData, source) {
       ((loaded / COACHELLA_ARTISTS.length) * 100) + '%';
   }
   fixRound1Elimination(); // after merging cache, pull back anyone eliminated with < 3 ratings
+  purgeQueueIneligible(); // drop queued songs for artists already done with round 1 (or round 2 done)
   console.log(`Loaded ${loaded} artists from ${source}`);
   return loaded;
 }
@@ -2139,6 +2141,7 @@ function skipSong() {
     clearTimeout(window._ratingAdvanceTimeout);
     window._ratingAdvanceTimeout = null;
   }
+  purgeQueueIneligible();
   playNext();
 }
 
