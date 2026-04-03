@@ -191,6 +191,15 @@
     text-transform: none;
   }
 
+  .stat-phase .stat-build-stamp {
+    display: block;
+    margin-top: 6px;
+    font-size: 0.65rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: rgba(255,255,255,0.28);
+  }
+
   /* ── NOW PLAYING ── */
   #player-section { display: none; }
 
@@ -828,6 +837,7 @@
     <div class="stat-phase" id="stat-phase" aria-live="polite">
       <span class="stat-phase-label">Phase:</span>
       <span class="stat-phase-value" id="stat-phase-value">—</span>
+      <span class="stat-build-stamp" id="stat-app-build"></span>
     </div>
 
     <div class="progress-bar">
@@ -967,6 +977,9 @@ const SCOPES = [
   'playlist-modify-private',
   'streaming'
 ].join(' ');
+
+// Bump when you ship logic/UI changes — visible under Phase so you know the live file updated
+const APP_BUILD_STAMP = 'hydration-1';
 
 const ROUND1_TARGET = 3;         // rated songs before R1 verdict (no 4th until everyone finishes R1)
 const ROUND2_TOTAL_TARGET = 6;   // total rated across R1+R2 before R2 verdict (3 new in R2)
@@ -1306,6 +1319,7 @@ function globalRound1Complete() {
   // While Spotify is still fetching batches, many acts have no `tracks` yet. Skipping them would
   // falsely mark R1 "done" and jump to R2, so artists at 3 ratings would re-enter shuffle.
   if (loadingInBackground) return false;
+  if (!tracksCatalogHydrated) return false;
 
   for (const lineupName of COACHELLA_ARTISTS) {
     const nk = artistNormKey(lineupName);
@@ -1806,6 +1820,9 @@ async function spotifyFetch(endpoint, options = {}, retriesLeft = SPOTIFY_RETRY_
 // INIT
 // ═══════════════════════════════════════════
 let loadingInBackground = false;
+// Round gates stay false until loadArtistTracksInBackground() finishes (finally). Prevents R2 while
+// catalog/session is still settling (e.g. localStorage restore + instant playNext before tracks merge).
+let tracksCatalogHydrated = false;
 
 async function initApp() {
   showLoading('Connecting to Spotify...');
@@ -1904,15 +1921,10 @@ async function initApp() {
     if (!playerReady) await ensureDevice();
   }
 
-  if (hadFirebaseRatings) {
-    loadArtistTracksInBackground();
-    return;
-  }
-  if (sessionRestored) {
-    playNext();
-    return;
-  }
-  loadArtistTracksInBackground();
+  // Always run track hydration here (await) so round gates stay in Round 1 until catalog merge finishes.
+  // Previously, session restore called playNext() and returned without awaiting — tracksCatalogHydrated
+  // never flipped and serve.py pointed at a stale duplicate HTML file.
+  await loadArtistTracksInBackground();
   } catch (e) {
     console.error('initApp failed:', e);
     showError('Something went wrong starting the app. Please refresh and try again.');
@@ -2211,6 +2223,7 @@ async function loadArtistTracksInBackground() {
   }
   } finally {
     loadingInBackground = false;
+    tracksCatalogHydrated = true;
     updateStats();
   }
 }
@@ -2669,6 +2682,9 @@ function updateStats() {
   document.getElementById('stat-remaining').textContent = active;
   document.getElementById('stat-eliminated').textContent = eliminated;
   document.getElementById('stat-rated').textContent = totalRated;
+
+  const buildEl = document.getElementById('stat-app-build');
+  if (buildEl) buildEl.textContent = typeof APP_BUILD_STAMP !== 'undefined' ? `Build ${APP_BUILD_STAMP}` : '';
 
   const phaseValEl = document.getElementById('stat-phase-value');
   if (phaseValEl) {

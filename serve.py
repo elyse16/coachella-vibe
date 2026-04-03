@@ -10,7 +10,7 @@ import sys
 
 PORT = 8888
 HOST = "127.0.0.1"
-APP_FILE = "coachella-vibe-code.html"
+APP_FILE = "index.html"
 
 class Handler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
