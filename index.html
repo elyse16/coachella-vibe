@@ -979,7 +979,7 @@ const SCOPES = [
 ].join(' ');
 
 // Bump when you ship logic/UI changes — visible under Phase so you know the live file updated
-const APP_BUILD_STAMP = 'hydration-1';
+const APP_BUILD_STAMP = 'hydration-2';
 
 const ROUND1_TARGET = 3;         // rated songs before R1 verdict (no 4th until everyone finishes R1)
 const ROUND2_TOTAL_TARGET = 6;   // total rated across R1+R2 before R2 verdict (3 new in R2)
@@ -1870,6 +1870,12 @@ async function initApp() {
     }
     consolidateDuplicateArtistKeys();
     reconcileEliminationFromRatings();
+    try {
+      const rawLs = localStorage.getItem('vibe_session');
+      if (rawLs) mergeLocalSessionOverlay(JSON.parse(rawLs));
+    } catch (_) { /* ignore corrupt session */ }
+    consolidateDuplicateArtistKeys();
+    reconcileEliminationFromRatings();
     totalRated = savedRatings.length;
     updateStats();
     renderLeaderboards();
@@ -1948,6 +1954,52 @@ function saveTrackCache(data) {
   try {
     localStorage.setItem(TRACK_CACHE_LS_KEY, JSON.stringify({ ts: Date.now(), data }));
   } catch { /* storage full */ }
+}
+
+// When ratings come from Firebase, we still merge tracks / playedTrackIds / queue from vibe_session
+// so a device that had full local state does not lose catalogs after signing in on another path.
+function mergeLocalSessionOverlay(session) {
+  if (!session || typeof session !== 'object' || !session.artists) return;
+  for (const [k, sa] of Object.entries(session.artists)) {
+    if (!sa || typeof sa !== 'object') continue;
+    let key = k;
+    if (!artists[key]) {
+      const alt = lineupKeyForStoredArtistName(k);
+      if (artists[alt]) key = alt;
+      else continue;
+    }
+    const a = artists[key];
+    if (!a) continue;
+    const st = Array.isArray(sa.tracks) ? sa.tracks : [];
+    const at = Array.isArray(a.tracks) ? a.tracks : [];
+    if (st.length > at.length) {
+      a.tracks = st.slice();
+      if (sa.spotifyId) a.spotifyId = sa.spotifyId;
+    }
+    if (Array.isArray(sa.playedTrackIds)) {
+      if (!Array.isArray(a.playedTrackIds)) a.playedTrackIds = [];
+      const seen = new Set(a.playedTrackIds);
+      for (const id of sa.playedTrackIds) {
+        if (id && !seen.has(id)) {
+          a.playedTrackIds.push(id);
+          seen.add(id);
+        }
+      }
+    }
+  }
+  if (Array.isArray(session.songQueue) && session.songQueue.length) {
+    const seen = new Set(
+      songQueue.map(s => `${resolveLineupArtistKey(s.artist)}\t${s.track?.id}`)
+    );
+    for (const item of session.songQueue) {
+      if (!item?.track?.id) continue;
+      const art = resolveLineupArtistKey(item.artist);
+      const sig = `${art}\t${item.track.id}`;
+      if (seen.has(sig)) continue;
+      songQueue.push({ artist: art, track: item.track });
+      seen.add(sig);
+    }
+  }
 }
 
 function loadCacheIntoState(cacheData, source) {
@@ -2074,40 +2126,48 @@ async function loadArtistTracksInBackground() {
   spotifyRateLimitTriggered = false;
 
   try {
-  // Priority 1: Firestore shared cache (one fetch serves all users)
+  // Priority 1: Firestore — merge even partial caches (below MIN_CACHE_ARTISTS), then Spotify fills gaps
   const fbCached = await fbGetTrackCache();
-  if (fbCached && isUsableTrackCache(fbCached)) {
-    loadCacheIntoState(fbCached, 'Firestore');
+  const fbTrackCount = fbCached ? countArtistsWithTracks(fbCached) : 0;
+  if (fbCached && fbTrackCount > 0) {
+    loadCacheIntoState(fbCached, fbTrackCount >= MIN_CACHE_ARTISTS ? 'Firestore' : 'Firestore partial');
     saveTrackCache(fbCached);
-    updateStats();
-    renderLeaderboards();
-    checkFinishEligibility();
-    if (songQueue.length > 0) await playNext();
-    saveSession();
-    showToast(`All ${Object.keys(artists).length} artists loaded!`, 'kept-toast');
-    return;
-  } else if (fbCached) {
-    console.warn(`Ignoring incomplete Firestore cache (${countArtistsWithTracks(fbCached)} artists)`);
+    if (fbTrackCount >= MIN_CACHE_ARTISTS) {
+      updateStats();
+      renderLeaderboards();
+      checkFinishEligibility();
+      if (songQueue.length > 0) await playNext();
+      saveSession();
+      showToast(`All ${Object.keys(artists).length} artists loaded!`, 'kept-toast');
+      return;
+    }
+    console.warn(`Firestore track cache partial (${fbTrackCount}/${COACHELLA_ARTISTS.length}); will merge Spotify for missing acts`);
+  } else if (fbCached && fbTrackCount === 0) {
+    console.warn('Firestore track cache present but no per-lineup tracks');
   }
 
-  // Priority 2: localStorage cache (offline / faster fallback)
   const lsCached = getTrackCache();
-  if (lsCached && isUsableTrackCache(lsCached)) {
-    loadCacheIntoState(lsCached, 'localStorage');
-    fbSaveTrackCache(lsCached);
-    updateStats();
-    renderLeaderboards();
-    checkFinishEligibility();
-    if (songQueue.length > 0) await playNext();
-    saveSession();
-    showToast(`All ${Object.keys(artists).length} artists loaded!`, 'kept-toast');
-    return;
+  const lsTrackCount = lsCached ? countArtistsWithTracks(lsCached) : 0;
+  if (lsCached && lsTrackCount > 0) {
+    loadCacheIntoState(lsCached, lsTrackCount >= MIN_CACHE_ARTISTS ? 'localStorage' : 'localStorage partial');
+    saveTrackCache(lsCached);
+    if (lsTrackCount >= MIN_CACHE_ARTISTS) {
+      fbSaveTrackCache(lsCached);
+      updateStats();
+      renderLeaderboards();
+      checkFinishEligibility();
+      if (songQueue.length > 0) await playNext();
+      saveSession();
+      showToast(`All ${Object.keys(artists).length} artists loaded!`, 'kept-toast');
+      return;
+    }
+    console.warn(`Local track cache partial (${lsTrackCount}); will merge Spotify for missing acts`);
   } else if (lsCached) {
-    console.warn(`Ignoring incomplete local cache (${countArtistsWithTracks(lsCached)} artists)`);
+    console.warn(`Ignoring unusable local cache (${countArtistsWithTracks(lsCached)} artists)`);
     localStorage.removeItem(TRACK_CACHE_LS_KEY);
   }
 
-  // Priority 3: Fresh fetch from Spotify API
+  // Priority 3: Spotify — only for lineup acts still missing `tracks`
   let loaded = 0;
   let successfulLoads = 0;
   let firstSongPlayed = false;
@@ -2130,17 +2190,29 @@ async function loadArtistTracksInBackground() {
       break;
     }
 
-    const batchTracks = await fetchTracksForArtistBatch(batch);
+    const missingFromBatch = batch.filter(name => !(getArtistState(name)?.tracks?.length));
+    let batchTracks = {};
+    if (missingFromBatch.length) {
+      batchTracks = await fetchTracksForArtistBatch(missingFromBatch);
+    }
 
     for (const name of batch) {
       document.getElementById('progress-fill').style.width =
         ((loaded / COACHELLA_ARTISTS.length) * 100) + '%';
+
+      if (getArtistState(name)?.tracks?.length) {
+        loaded++;
+        consecutiveFailures = 0;
+        artistsSinceStagePause++;
+        continue;
+      }
 
       const rawTracks = (batchTracks[name] || []).slice(0, 10);
       if (!rawTracks.length) {
         console.warn(`No tracks found for: ${name}`);
         loaded++;
         consecutiveFailures++;
+        artistsSinceStagePause++;
         continue;
       }
 
@@ -2202,24 +2274,28 @@ async function loadArtistTracksInBackground() {
   consolidateDuplicateArtistKeys();
   reconcileEliminationFromRatings();
 
+  const spotifyCacheCount = countArtistsWithTracks(trackData);
   if (isUsableTrackCache(trackData)) {
     saveTrackCache(trackData);
     fbSaveTrackCache(trackData);
+  } else if (spotifyCacheCount > 0) {
+    saveTrackCache(trackData);
+    fbSaveTrackCache(trackData);
+    console.warn(`Saved partial Spotify track cache (${spotifyCacheCount} artists)`);
   } else {
-    console.warn(`Not caching partial Spotify data (${countArtistsWithTracks(trackData)} artists)`);
+    console.warn(`Not caching empty Spotify track batch (${spotifyCacheCount} artists)`);
   }
   checkFinishEligibility();
   saveSession();
-  if (!firstSongPlayed && songQueue.length === 0 && successfulLoads > 0) {
-    buildQueue();
-    if (songQueue.length > 0) await playNext();
-  }
+  if (!firstSongPlayed && songQueue.length === 0) buildQueue();
+  if (!firstSongPlayed && songQueue.length > 0) await playNext();
+  const lineupWithTracksNow = COACHELLA_ARTISTS.filter(n => (getArtistState(n)?.tracks?.length || 0) > 0).length;
   if (successfulLoads === COACHELLA_ARTISTS.length) {
     showToast(`All ${successfulLoads} artists loaded!`, 'kept-toast');
   } else if (successfulLoads > 0) {
-    showToast(`Loaded ${successfulLoads}/${COACHELLA_ARTISTS.length} artists (Spotify rate limited).`, 'eliminated-toast');
-  } else {
-    showError('Spotify is rate limiting requests right now. Wait about a minute, then retry.');
+    showToast(`Loaded ${successfulLoads}/${COACHELLA_ARTISTS.length} artists from Spotify (cache + API).`, 'eliminated-toast');
+  } else if (lineupWithTracksNow === 0) {
+    showError('No track catalog yet — Spotify may be rate limiting. Wait a minute, refresh, or try another network.');
   }
   } finally {
     loadingInBackground = false;
@@ -2696,7 +2772,9 @@ function updateStats() {
       }
     }
     if (!hasAnyCatalog) {
-      phaseValEl.textContent = 'Loading artists…';
+      phaseValEl.textContent = tracksCatalogHydrated
+        ? 'No track catalog — refresh or check Spotify'
+        : 'Loading artists…';
     } else if (isFinalPlaylistPhase()) {
       phaseValEl.textContent = 'Final playlist';
     } else if (isRound2Phase()) {
