@@ -979,7 +979,7 @@ const SCOPES = [
 ].join(' ');
 
 // Bump when you ship logic/UI changes — visible under Phase so you know the live file updated
-const APP_BUILD_STAMP = 'hydration-3';
+const APP_BUILD_STAMP = 'hydration-4';
 
 const ROUND1_TARGET = 3;         // rated songs before R1 verdict (no 4th until everyone finishes R1)
 const ROUND2_TOTAL_TARGET = 6;   // total rated across R1+R2 before R2 verdict (3 new in R2)
@@ -1019,6 +1019,27 @@ function artistInShuffle(name) {
   if (anyEliminatedForNorm(nk)) return false;
   return unionRatingsCountForNorm(nk) < ROUND2_TOTAL_TARGET;
 }
+
+function artistHasUnheardStrictTrack(lineupName) {
+  if (!artistInShuffle(lineupName)) return false;
+  const data = getArtistState(lineupName);
+  if (!data?.tracks?.length) return false;
+  return data.tracks.some((t) => !trackAlreadyPlayed(lineupName, t.id));
+}
+
+function strictShuffleHasCandidates() {
+  return COACHELLA_ARTISTS.some((n) => artistHasUnheardStrictTrack(n));
+}
+
+// Prefer round rules; if no strict-eligible unheard track exists anywhere, widen so playback never deadlocks on an empty queue.
+function artistEligibleForPlaybackQueue(name) {
+  const nk = artistNormKey(name);
+  if (!hasTracksForNorm(nk)) return false;
+  if (anyEliminatedForNorm(nk)) return false;
+  if (artistInShuffle(name)) return true;
+  return !strictShuffleHasCandidates();
+}
+
 function trackAlreadyRated(artistName, trackId) {
   const nk = artistNormKey(artistName);
   for (const k of Object.keys(artists)) {
@@ -1077,7 +1098,7 @@ function purgeQueueIneligible() {
     .map(s => ({ ...s, artist: resolveLineupArtistKey(s.artist) }))
     .filter(s => {
       if (trackAlreadyPlayed(s.artist, s.track.id)) return false;
-      if (!artistInShuffle(s.artist)) return false;
+      if (!artistEligibleForPlaybackQueue(s.artist)) return false;
       return true;
     });
   if (songQueue.length < before) saveSession();
@@ -2017,7 +2038,7 @@ function loadCacheIntoState(cacheData, source) {
       round2LockedFinal: !!existing.round2LockedFinal,
       avgRating: existing.avgRating
     };
-    if (!artistInShuffle(name)) { loaded++; continue; }
+    if (!artistEligibleForPlaybackQueue(name)) { loaded++; continue; }
     for (const track of c.tracks) {
       if (trackAlreadyPlayed(name, track.id)) continue;
       const pos = Math.floor(Math.random() * (songQueue.length + 1));
@@ -2230,7 +2251,7 @@ async function loadArtistTracksInBackground() {
         avgRating: existing.avgRating
       };
 
-      if (artistInShuffle(name)) {
+      if (artistEligibleForPlaybackQueue(name)) {
         for (const track of tracks) {
           if (trackAlreadyPlayed(name, track.id)) continue;
           const pos = Math.floor(Math.random() * (songQueue.length + 1));
@@ -2298,6 +2319,9 @@ async function loadArtistTracksInBackground() {
       if (songQueue.length === 0) buildQueue();
       if (songQueue.length > 0) await playNext();
     }
+    if (!currentSong) {
+      setNowPlayingIdle('Tap Next to start, or confirm Spotify is open (Premium)');
+    }
   }
 }
 
@@ -2307,7 +2331,7 @@ function buildQueue() {
   for (const artistName of COACHELLA_ARTISTS) {
     const data = getArtistState(artistName);
     if (!data || !data.tracks || !data.tracks.length) continue;
-    if (!artistInShuffle(artistName)) continue;
+    if (!artistEligibleForPlaybackQueue(artistName)) continue;
     for (const track of data.tracks) {
       if (trackAlreadyPlayed(artistName, track.id)) continue;
       songQueue.push({ artist: artistName, track });
@@ -2483,7 +2507,7 @@ async function playNext() {
     songQueue = songQueue
       .map(s => ({ ...s, artist: resolveLineupArtistKey(s.artist) }))
       .filter(s => {
-        if (!artistInShuffle(s.artist)) return false;
+        if (!artistEligibleForPlaybackQueue(s.artist)) return false;
         if (trackAlreadyPlayed(s.artist, s.track.id)) return false;
         return true;
       });
@@ -2498,17 +2522,21 @@ async function playNext() {
         } else {
           showToast('All songs have been played! Check your results.');
         }
+        setNowPlayingIdle('No songs in shuffle right now');
         return;
       }
     }
 
     // Safety: drop any ineligible songs at the front (e.g. artist just hit 3 in round 1)
-    while (songQueue.length > 0 && (!artistInShuffle(songQueue[0].artist) || trackAlreadyPlayed(songQueue[0].artist, songQueue[0].track.id))) {
+    while (songQueue.length > 0 && (!artistEligibleForPlaybackQueue(songQueue[0].artist) || trackAlreadyPlayed(songQueue[0].artist, songQueue[0].track.id))) {
       songQueue.shift();
     }
     if (songQueue.length === 0) {
       buildQueue();
-      if (songQueue.length === 0) return;
+      if (songQueue.length === 0) {
+        setNowPlayingIdle('No songs in shuffle right now');
+        return;
+      }
     }
 
     if (currentSong) {
@@ -2522,7 +2550,7 @@ async function playNext() {
         const next = songQueue.shift();
         if (!next) continue;
         next.artist = resolveLineupArtistKey(next.artist);
-        if (artistInShuffle(next.artist) && !trackAlreadyPlayed(next.artist, next.track.id)) {
+        if (artistEligibleForPlaybackQueue(next.artist) && !trackAlreadyPlayed(next.artist, next.track.id)) {
           return next;
         }
       }
@@ -2542,13 +2570,19 @@ async function playNext() {
       } else {
         showToast('All songs have been played! Check your results.');
       }
+      setNowPlayingIdle('Queue empty');
       return;
     }
     updateNowPlaying();
 
     // Play on Spotify
     const hasDevice = await ensureDevice();
-    if (!hasDevice) return;
+    if (!hasDevice) {
+      showError('No playback device. Open Spotify Premium and start playback once, or pick a device in Spotify Connect.');
+      const cnt = document.getElementById('np-count');
+      if (cnt) cnt.textContent = 'Waiting for Spotify device…';
+      return;
+    }
 
     const res = await spotifyFetch(`/me/player/play?device_id=${deviceId}`, {
       method: 'PUT',
@@ -2572,9 +2606,26 @@ async function playNext() {
   }
 }
 
+function setNowPlayingIdle(message) {
+  currentSong = null;
+  const art = document.getElementById('np-art');
+  if (art) {
+    art.removeAttribute('src');
+    art.style.visibility = 'hidden';
+  }
+  const tr = document.getElementById('np-track');
+  if (tr) tr.textContent = message || '—';
+  const ar = document.getElementById('np-artist');
+  if (ar) ar.textContent = '—';
+  const cnt = document.getElementById('np-count');
+  if (cnt) cnt.textContent = '';
+}
+
 function updateNowPlaying() {
   if (!currentSong) return;
-  document.getElementById('np-art').src = currentSong.track.art || '';
+  const artEl = document.getElementById('np-art');
+  artEl.style.visibility = '';
+  artEl.src = currentSong.track.art || '';
   document.getElementById('np-track').textContent = currentSong.track.name;
   document.getElementById('np-artist').textContent = lineupKeyForStoredArtistName(currentSong.artist);
 
