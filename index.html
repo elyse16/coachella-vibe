@@ -979,7 +979,7 @@ const SCOPES = [
 ].join(' ');
 
 // Bump when you ship logic/UI changes — visible under Phase so you know the live file updated
-const APP_BUILD_STAMP = 'hydration-2';
+const APP_BUILD_STAMP = 'hydration-3';
 
 const ROUND1_TARGET = 3;         // rated songs before R1 verdict (no 4th until everyone finishes R1)
 const ROUND2_TOTAL_TARGET = 6;   // total rated across R1+R2 before R2 verdict (3 new in R2)
@@ -2136,7 +2136,6 @@ async function loadArtistTracksInBackground() {
       updateStats();
       renderLeaderboards();
       checkFinishEligibility();
-      if (songQueue.length > 0) await playNext();
       saveSession();
       showToast(`All ${Object.keys(artists).length} artists loaded!`, 'kept-toast');
       return;
@@ -2156,7 +2155,6 @@ async function loadArtistTracksInBackground() {
       updateStats();
       renderLeaderboards();
       checkFinishEligibility();
-      if (songQueue.length > 0) await playNext();
       saveSession();
       showToast(`All ${Object.keys(artists).length} artists loaded!`, 'kept-toast');
       return;
@@ -2170,7 +2168,6 @@ async function loadArtistTracksInBackground() {
   // Priority 3: Spotify — only for lineup acts still missing `tracks`
   let loaded = 0;
   let successfulLoads = 0;
-  let firstSongPlayed = false;
   let consecutiveFailures = 0;
   const trackData = {};
   let initialStageDelayed = false;
@@ -2247,11 +2244,6 @@ async function loadArtistTracksInBackground() {
       updateStats();
       renderLeaderboards();
 
-      if (!firstSongPlayed && songQueue.length > 0) {
-        firstSongPlayed = true;
-        await playNext();
-      }
-
       if (!initialStageDelayed && loaded >= INITIAL_ARTIST_LOAD_COUNT) {
         initialStageDelayed = true;
         showToast(`Loaded first ${INITIAL_ARTIST_LOAD_COUNT} artists. Cooling down before loading more...`, 'kept-toast');
@@ -2287,8 +2279,6 @@ async function loadArtistTracksInBackground() {
   }
   checkFinishEligibility();
   saveSession();
-  if (!firstSongPlayed && songQueue.length === 0) buildQueue();
-  if (!firstSongPlayed && songQueue.length > 0) await playNext();
   const lineupWithTracksNow = COACHELLA_ARTISTS.filter(n => (getArtistState(n)?.tracks?.length || 0) > 0).length;
   if (successfulLoads === COACHELLA_ARTISTS.length) {
     showToast(`All ${successfulLoads} artists loaded!`, 'kept-toast');
@@ -2298,9 +2288,16 @@ async function loadArtistTracksInBackground() {
     showError('No track catalog yet — Spotify may be rate limiting. Wait a minute, refresh, or try another network.');
   }
   } finally {
+    // Must flip AFTER try body: buildQueue/playNext need real round gates. While loadingInBackground was true,
+    // artistInShuffle only allowed <3 rated acts → empty queue for progressed users → playNext bailed and UI
+    // stayed on "Loading…" with nothing retrying after load finished.
     loadingInBackground = false;
     tracksCatalogHydrated = true;
     updateStats();
+    if (!currentSong) {
+      if (songQueue.length === 0) buildQueue();
+      if (songQueue.length > 0) await playNext();
+    }
   }
 }
 
