@@ -3,6 +3,9 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<!-- Ask browsers/proxies to revalidate so GitHub Pages users pick up new deploys -->
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
 <title>COACHELLA</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎪</text></svg>">
 <style>
@@ -1300,6 +1303,10 @@ function hasTracksForNorm(normKey) {
 }
 
 function globalRound1Complete() {
+  // While Spotify is still fetching batches, many acts have no `tracks` yet. Skipping them would
+  // falsely mark R1 "done" and jump to R2, so artists at 3 ratings would re-enter shuffle.
+  if (loadingInBackground) return false;
+
   for (const lineupName of COACHELLA_ARTISTS) {
     const nk = artistNormKey(lineupName);
     if (!hasTracksForNorm(nk)) continue;
@@ -2054,6 +2061,7 @@ async function loadArtistTracksInBackground() {
   loadingInBackground = true;
   spotifyRateLimitTriggered = false;
 
+  try {
   // Priority 1: Firestore shared cache (one fetch serves all users)
   const fbCached = await fbGetTrackCache();
   if (fbCached && isUsableTrackCache(fbCached)) {
@@ -2062,7 +2070,6 @@ async function loadArtistTracksInBackground() {
     updateStats();
     renderLeaderboards();
     checkFinishEligibility();
-    loadingInBackground = false;
     if (songQueue.length > 0) await playNext();
     saveSession();
     showToast(`All ${Object.keys(artists).length} artists loaded!`, 'kept-toast');
@@ -2079,7 +2086,6 @@ async function loadArtistTracksInBackground() {
     updateStats();
     renderLeaderboards();
     checkFinishEligibility();
-    loadingInBackground = false;
     if (songQueue.length > 0) await playNext();
     saveSession();
     showToast(`All ${Object.keys(artists).length} artists loaded!`, 'kept-toast');
@@ -2190,7 +2196,6 @@ async function loadArtistTracksInBackground() {
   } else {
     console.warn(`Not caching partial Spotify data (${countArtistsWithTracks(trackData)} artists)`);
   }
-  loadingInBackground = false;
   checkFinishEligibility();
   saveSession();
   if (!firstSongPlayed && songQueue.length === 0 && successfulLoads > 0) {
@@ -2203,6 +2208,10 @@ async function loadArtistTracksInBackground() {
     showToast(`Loaded ${successfulLoads}/${COACHELLA_ARTISTS.length} artists (Spotify rate limited).`, 'eliminated-toast');
   } else {
     showError('Spotify is rate limiting requests right now. Wait about a minute, then retry.');
+  }
+  } finally {
+    loadingInBackground = false;
+    updateStats();
   }
 }
 
