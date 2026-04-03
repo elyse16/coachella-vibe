@@ -946,12 +946,20 @@ const ELIMINATION_THRESHOLD = 3.0;
 // Round 1: still ranking (artists with < 3 ratings). Round 2: full lineup has tracks AND everyone has 3+ ratings; only IN artists with < 8 plays stay in shuffle.
 function isRound2() {
   if (!COACHELLA_ARTISTS.length) return false;
-  return COACHELLA_ARTISTS.every(lineupName => {
+  for (const lineupName of COACHELLA_ARTISTS) {
     const nk = artistNormKey(lineupName);
     const tracks = bestTracksArrayForNorm(nk);
     if (!tracks || !tracks.length) return false;
-    return unionRatingsCountForNorm(nk) >= MIN_RATINGS;
-  });
+    if (unionRatingsCountForNorm(nk) < MIN_RATINGS) return false;
+  }
+  // Sanity: can't be round 2 without at least (every act × 3) rating rows total (trips impossible every() true).
+  let totalRatingRows = 0;
+  for (const k of Object.keys(artists)) {
+    const a = artists[k];
+    if (a && Array.isArray(a.ratings)) totalRatingRows += a.ratings.length;
+  }
+  if (totalRatingRows < COACHELLA_ARTISTS.length * MIN_RATINGS) return false;
+  return true;
 }
 // Distinct tracks this user has rated or already heard (skip / advance) — robust when ratings and tracks lived on duplicate `artists` keys.
 function uniqueHeardTrackCount(a) {
@@ -1188,6 +1196,7 @@ function isUsableTrackCache(cacheData) {
 function normalizeArtistName(name) {
   return (name || '')
     .toString()
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')
     .replace(/\u00a0/g, ' ')
     .toLowerCase()
     .replace(/\s+/g, ' ')
@@ -1315,6 +1324,23 @@ function getArtistState(name) {
   });
 }
 
+// Break accidental shared Array references between artists (e.g. bad merge / JSON edge cases).
+function detachArtistMutableArrays() {
+  for (const k of Object.keys(artists)) {
+    const a = artists[k];
+    if (!a) continue;
+    if (Array.isArray(a.ratings)) {
+      a.ratings = a.ratings.map(r => ({
+        trackId: r.trackId || r.track_id,
+        trackName: r.trackName || r.track_name || '',
+        score: r.score
+      }));
+    }
+    if (Array.isArray(a.playedTrackIds)) a.playedTrackIds = a.playedTrackIds.slice();
+    if (Array.isArray(a.tracks)) a.tracks = a.tracks.slice();
+  }
+}
+
 // Merge Firebase / session / Spotify casing aliases into one row per act (official lineup key when on poster).
 function consolidateDuplicateArtistKeys() {
   const byNorm = new Map();
@@ -1373,6 +1399,7 @@ function consolidateDuplicateArtistKeys() {
     if (!Array.isArray(merged.playedTrackIds)) merged.playedTrackIds = [];
     artists[target] = merged;
   }
+  detachArtistMutableArrays();
 }
 
 function getArtistRecordKey(name) {
@@ -2250,8 +2277,32 @@ async function playNext() {
       playedHistory.push(currentSong);
       if (playedHistory.length > PLAYED_HISTORY_MAX) playedHistory.shift();
     }
-    currentSong = songQueue.shift();
-    if (currentSong) currentSong.artist = resolveLineupArtistKey(currentSong.artist);
+
+    function pickNextEligibleFromQueue() {
+      while (songQueue.length > 0) {
+        const next = songQueue.shift();
+        if (!next) continue;
+        next.artist = resolveLineupArtistKey(next.artist);
+        if (artistInShuffle(next.artist) && !trackAlreadyPlayed(next.artist, next.track.id)) {
+          return next;
+        }
+      }
+      return null;
+    }
+
+    currentSong = pickNextEligibleFromQueue();
+    if (!currentSong) {
+      buildQueue();
+      currentSong = pickNextEligibleFromQueue();
+    }
+    if (!currentSong) {
+      if (isRound2()) {
+        showToast('Round 2 complete! All songs from your IN artists have been played.');
+      } else {
+        showToast('All songs have been played! Check your results.');
+      }
+      return;
+    }
     updateNowPlaying();
 
     // Play on Spotify
