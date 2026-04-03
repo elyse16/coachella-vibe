@@ -979,7 +979,7 @@ const SCOPES = [
 ].join(' ');
 
 // Bump when you ship logic/UI changes — visible under Phase so you know the live file updated
-const APP_BUILD_STAMP = 'hydration-4';
+const APP_BUILD_STAMP = 'hydration-5';
 
 const ROUND1_TARGET = 3;         // rated songs before R1 verdict (no 4th until everyone finishes R1)
 const ROUND2_TOTAL_TARGET = 6;   // total rated across R1+R2 before R2 verdict (3 new in R2)
@@ -2418,7 +2418,7 @@ function initWebPlayer() {
         const dur = state.duration;
         const atEnd = state.paused && dur > 0 && pos >= Math.max(0, dur - 1000);
         const currentUri = state.track_window?.current_track?.uri;
-        if (atEnd && currentSong && currentUri === currentSong.track.uri && !window._trackEndFired) {
+        if (atEnd && currentSong && currentUri === resolveSpotifyTrackUri(currentSong.track) && !window._trackEndFired) {
           window._trackEndFired = true;
           playNext();
         }
@@ -2482,6 +2482,51 @@ async function ensureDevice() {
     return true;
   }
   showError('No playback device available. Please make sure you have Spotify Premium and allow audio in your browser.');
+  return false;
+}
+
+function resolveSpotifyTrackUri(track) {
+  if (!track) return '';
+  const u = track.uri;
+  if (typeof u === 'string' && /^spotify:track:[a-zA-Z0-9]+$/.test(u)) return u;
+  const id = track.id;
+  if (typeof id === 'string' && /^[a-zA-Z0-9]+$/.test(id)) return `spotify:track:${id}`;
+  return '';
+}
+
+async function spotifyStartTrackPlayback(track) {
+  const uri = resolveSpotifyTrackUri(track);
+  if (!uri) {
+    console.error('Coachella Vibe: track missing Spotify uri/id', track);
+    showToast('Track missing Spotify link — try Next.', 'eliminated-toast');
+    return false;
+  }
+  const body = JSON.stringify({ uris: [uri] });
+
+  async function playOnDevice(useDevice) {
+    const q = useDevice && deviceId
+      ? `?device_id=${encodeURIComponent(deviceId)}`
+      : '';
+    return await spotifyFetch(`/me/player/play${q}`, { method: 'PUT', body });
+  }
+
+  let res = await playOnDevice(true);
+  if (res !== null) return true;
+
+  if (deviceId) {
+    await spotifyFetch('/me/player', {
+      method: 'PUT',
+      body: JSON.stringify({ device_ids: [deviceId], play: false })
+    });
+    await sleep(400);
+    res = await playOnDevice(true);
+    if (res !== null) return true;
+  }
+
+  res = await playOnDevice(false);
+  if (res !== null) return true;
+
+  console.error('Coachella Vibe: all play attempts failed for', uri);
   return false;
 }
 
@@ -2584,13 +2629,9 @@ async function playNext() {
       return;
     }
 
-    const res = await spotifyFetch(`/me/player/play?device_id=${deviceId}`, {
-      method: 'PUT',
-      body: JSON.stringify({ uris: [currentSong.track.uri] })
-    });
-
-    if (res === null) {
-      showError('Playback failed. Make sure Spotify is open and active.');
+    const ok = await spotifyStartTrackPlayback(currentSong.track);
+    if (!ok) {
+      showError('Playback failed. Open Spotify (Premium), start any song once, pick this browser in Connect, then tap Next.');
     } else {
       isPlaying = true;
       updatePlayPauseIcon();
@@ -2680,10 +2721,7 @@ async function previousTrack() {
     updateNowPlaying();
     const hasDevice = await ensureDevice();
     if (hasDevice) {
-      await spotifyFetch(`/me/player/play?device_id=${deviceId}`, {
-        method: 'PUT',
-        body: JSON.stringify({ uris: [currentSong.track.uri] })
-      });
+      await spotifyStartTrackPlayback(currentSong.track);
       isPlaying = true;
       updatePlayPauseIcon();
       hideError();
@@ -2697,10 +2735,7 @@ async function previousTrack() {
       { method: 'POST' }
     );
     if (prevRes === null) {
-      await spotifyFetch(`/me/player/play?device_id=${deviceId}`, {
-        method: 'PUT',
-        body: JSON.stringify({ uris: [currentSong.track.uri] })
-      });
+      await spotifyStartTrackPlayback(currentSong.track);
     } else {
       isPlaying = true;
       updatePlayPauseIcon();
