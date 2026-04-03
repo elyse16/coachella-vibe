@@ -167,6 +167,27 @@
     font-weight: 300;
   }
 
+  .stat-phase {
+    text-align: center;
+    font-size: 0.78rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: rgba(255,255,255,0.42);
+    margin: -4px 0 2px;
+    line-height: 1.4;
+  }
+
+  .stat-phase .stat-phase-label {
+    margin-right: 6px;
+  }
+
+  .stat-phase .stat-phase-value {
+    color: var(--desert-gold);
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    text-transform: none;
+  }
+
   /* ── NOW PLAYING ── */
   #player-section { display: none; }
 
@@ -801,6 +822,11 @@
       </div>
     </div>
 
+    <div class="stat-phase" id="stat-phase" aria-live="polite">
+      <span class="stat-phase-label">Phase:</span>
+      <span class="stat-phase-value" id="stat-phase-value">—</span>
+    </div>
+
     <div class="progress-bar">
       <div class="progress-fill" id="progress-fill"></div>
     </div>
@@ -872,7 +898,7 @@
         Finish & Create Playlist
       </button>
       <div style="font-size:0.75rem; color:rgba(255,255,255,0.3); margin-top:8px;">
-        Available after all artists have 8 plays or are eliminated
+        Available when every lineup act is eliminated or in your final playlist (6 rated songs, avg ≥ 3.5)
       </div>
     </div>
   </div>
@@ -939,28 +965,12 @@ const SCOPES = [
   'streaming'
 ].join(' ');
 
-const MIN_RATINGS = 3;
-const FINAL_LINEUP_RATINGS = 8;  // Round 2: each IN artist gets 8 total plays (including round 1's 3), then moves to final lineup
-const ELIMINATION_THRESHOLD = 3.0;
-
-// Round 1: still ranking (artists with < 3 ratings). Round 2: full lineup has tracks AND everyone has 3+ ratings; only IN artists with < 8 plays stay in shuffle.
-function isRound2() {
-  if (!COACHELLA_ARTISTS.length) return false;
-  for (const lineupName of COACHELLA_ARTISTS) {
-    const nk = artistNormKey(lineupName);
-    const tracks = bestTracksArrayForNorm(nk);
-    if (!tracks || !tracks.length) return false;
-    if (unionRatingsCountForNorm(nk) < MIN_RATINGS) return false;
-  }
-  // Sanity: can't be round 2 without at least (every act × 3) rating rows total (trips impossible every() true).
-  let totalRatingRows = 0;
-  for (const k of Object.keys(artists)) {
-    const a = artists[k];
-    if (a && Array.isArray(a.ratings)) totalRatingRows += a.ratings.length;
-  }
-  if (totalRatingRows < COACHELLA_ARTISTS.length * MIN_RATINGS) return false;
-  return true;
-}
+const ROUND1_TARGET = 3;         // rated songs before R1 verdict (no 4th until everyone finishes R1)
+const ROUND2_TOTAL_TARGET = 6;   // total rated across R1+R2 before R2 verdict (3 new in R2)
+const ROUND1_MIN_AVG = 3.0;      // avg < this after 3 ratings → eliminated
+const ROUND2_MIN_AVG = 3.5;      // avg < this after 6 ratings → eliminated; else final playlist
+const MIN_RATINGS = ROUND1_TARGET; // legacy alias for Firebase / session code paths
+const ELIMINATION_THRESHOLD = ROUND1_MIN_AVG;
 // Distinct tracks this user has rated or already heard (skip / advance) — robust when ratings and tracks lived on duplicate `artists` keys.
 function uniqueHeardTrackCount(a) {
   if (!a) return 0;
@@ -977,11 +987,21 @@ function uniqueHeardTrackCount(a) {
 
 function artistInShuffle(name) {
   const nk = artistNormKey(name);
-  const tracks = bestTracksArrayForNorm(nk);
-  if (!tracks || !tracks.length) return false;
-  const ratedN = unionRatingsCountForNorm(nk);
-  if (isRound2()) return !anyEliminatedForNorm(nk) && ratedN < FINAL_LINEUP_RATINGS;
-  return ratedN < MIN_RATINGS;
+  if (!hasTracksForNorm(nk)) return false;
+
+  if (isFinalPlaylistPhase()) {
+    return isNormFinalist(nk);
+  }
+
+  if (isRound1Phase()) {
+    if (anyEliminatedForNorm(nk)) return false;
+    return unionRatingsCountForNorm(nk) < ROUND1_TARGET;
+  }
+
+  // Round 2: everyone finished R1; only R1 survivors get 3 more rated songs (6 total)
+  if (!survivedRound1Norm(nk)) return false;
+  if (anyEliminatedForNorm(nk)) return false;
+  return unionRatingsCountForNorm(nk) < ROUND2_TOTAL_TARGET;
 }
 function trackAlreadyRated(artistName, trackId) {
   const nk = artistNormKey(artistName);
@@ -1026,7 +1046,7 @@ function fixRound1Elimination() {
   for (const name of Object.keys(artists)) {
     const a = artists[name];
     if (!a || !a.eliminated) continue;
-    if (unionRatingsCountForNorm(artistNormKey(name)) < MIN_RATINGS) {
+    if (unionRatingsCountForNorm(artistNormKey(name)) < ROUND1_TARGET) {
       a.eliminated = false;
       changed = true;
     }
@@ -1274,6 +1294,124 @@ function anyEliminatedForNorm(normKey) {
   return e;
 }
 
+function hasTracksForNorm(normKey) {
+  const t = bestTracksArrayForNorm(normKey);
+  return Array.isArray(t) && t.length > 0;
+}
+
+function globalRound1Complete() {
+  for (const lineupName of COACHELLA_ARTISTS) {
+    const nk = artistNormKey(lineupName);
+    if (!hasTracksForNorm(nk)) continue;
+    if (unionRatingsCountForNorm(nk) < ROUND1_TARGET) return false;
+  }
+  return true;
+}
+
+function survivedRound1Norm(nk) {
+  if (anyEliminatedForNorm(nk)) return false;
+  return unionRatingsCountForNorm(nk) >= ROUND1_TARGET;
+}
+
+function globalRound2Complete() {
+  if (!globalRound1Complete()) return false;
+  for (const lineupName of COACHELLA_ARTISTS) {
+    const nk = artistNormKey(lineupName);
+    if (!hasTracksForNorm(nk)) continue;
+    if (!survivedRound1Norm(nk)) continue;
+    if (anyEliminatedForNorm(nk)) continue;
+    if (unionRatingsCountForNorm(nk) < ROUND2_TOTAL_TARGET) return false;
+  }
+  return true;
+}
+
+function isRound1Phase() {
+  return !globalRound1Complete();
+}
+
+function isRound2Phase() {
+  return globalRound1Complete() && !globalRound2Complete();
+}
+
+function isFinalPlaylistPhase() {
+  return globalRound2Complete();
+}
+
+function normHasRound2Lock(nk) {
+  let locked = false;
+  forEachArtistRowMatchingNorm(nk, (a) => { if (a.round2LockedFinal) locked = true; });
+  return locked;
+}
+
+function isNormFinalist(nk) {
+  if (anyEliminatedForNorm(nk)) return false;
+  const rlen = unionRatingsCountForNorm(nk);
+  if (rlen < ROUND2_TOTAL_TARGET) return false;
+  if (normHasRound2Lock(nk)) return true;
+  return avgRatingForNorm(nk) >= ROUND2_MIN_AVG;
+}
+
+function lineupActFullyResolved(nk) {
+  if (!hasTracksForNorm(nk)) return true;
+  if (anyEliminatedForNorm(nk)) return true;
+  const rlen = unionRatingsCountForNorm(nk);
+  if (rlen < ROUND2_TOTAL_TARGET) return false;
+  if (normHasRound2Lock(nk)) return true;
+  return avgRatingForNorm(nk) >= ROUND2_MIN_AVG;
+}
+
+function allLineupActsResolved() {
+  for (const lineupName of COACHELLA_ARTISTS) {
+    const nk = artistNormKey(lineupName);
+    if (!lineupActFullyResolved(nk)) return false;
+  }
+  return true;
+}
+
+function setEliminatedAcrossNorm(nk, value) {
+  forEachArtistRowMatchingNorm(nk, (a) => { a.eliminated = value; });
+}
+
+function reconcileEliminationFromRatings() {
+  fixRound1Elimination();
+  const seen = new Set();
+  for (const k of Object.keys(artists)) {
+    const nk = artistNormKey(k);
+    if (seen.has(nk)) continue;
+    seen.add(nk);
+    if (!hasTracksForNorm(nk)) continue;
+    const rlen = unionRatingsCountForNorm(nk);
+    const uAvg = avgRatingForNorm(nk);
+
+    if (normHasRound2Lock(nk)) {
+      setEliminatedAcrossNorm(nk, false);
+      continue;
+    }
+
+    if (anyEliminatedForNorm(nk) && rlen >= ROUND1_TARGET) {
+      continue;
+    }
+
+    if (rlen > ROUND2_TOTAL_TARGET) {
+      forEachArtistRowMatchingNorm(nk, (a) => { a.round2LockedFinal = true; });
+      setEliminatedAcrossNorm(nk, false);
+      continue;
+    }
+
+    if (rlen >= ROUND2_TOTAL_TARGET) {
+      if (uAvg < ROUND2_MIN_AVG) setEliminatedAcrossNorm(nk, true);
+      else {
+        forEachArtistRowMatchingNorm(nk, (a) => { a.round2LockedFinal = true; });
+        setEliminatedAcrossNorm(nk, false);
+      }
+    } else if (rlen === ROUND1_TARGET) {
+      setEliminatedAcrossNorm(nk, uAvg < ROUND1_MIN_AVG);
+    } else {
+      setEliminatedAcrossNorm(nk, false);
+    }
+  }
+}
+
 // Prefer official lineup spelling when the act is on the poster (avoids duplicate `artists` keys).
 function resolveLineupArtistKey(name) {
   if (name == null || name === '') return name;
@@ -1362,6 +1500,7 @@ function consolidateDuplicateArtistKeys() {
       ratings: [],
       playedTrackIds: [],
       eliminated: false,
+      round2LockedFinal: false,
       avgRating: 0
     };
     for (const k of keys) {
@@ -1388,6 +1527,7 @@ function consolidateDuplicateArtistKeys() {
       }
       merged.playedTrackIds = [...ps];
       merged.eliminated = !!(merged.eliminated || cur.eliminated);
+      merged.round2LockedFinal = !!(merged.round2LockedFinal || cur.round2LockedFinal);
     }
     for (const k of keys) {
       delete artists[k];
@@ -1692,7 +1832,7 @@ async function initApp() {
     for (const [name, ratings] of Object.entries(ratingsByArtist)) {
       const uniq = dedupeRatingsByTrackId(ratings);
       if (!artists[name]) {
-        artists[name] = { spotifyId: '', tracks: [], ratings: [], playedTrackIds: [], eliminated: false, avgRating: 0 };
+        artists[name] = { spotifyId: '', tracks: [], ratings: [], playedTrackIds: [], eliminated: false, round2LockedFinal: false, avgRating: 0 };
       }
       artists[name].ratings = uniq.map(r => ({
         trackId: r.track_id || r.trackId,
@@ -1702,11 +1842,10 @@ async function initApp() {
       const rlen = artists[name].ratings.length;
       const avg = rlen ? artists[name].ratings.reduce((a, x) => a + x.score, 0) / rlen : 0;
       artists[name].avgRating = Math.round(avg * 10) / 10;
-      if (rlen >= MIN_RATINGS && avg < ELIMINATION_THRESHOLD) artists[name].eliminated = true;
       if (!Array.isArray(artists[name].playedTrackIds)) artists[name].playedTrackIds = [];
     }
     consolidateDuplicateArtistKeys();
-    fixRound1Elimination();
+    reconcileEliminationFromRatings();
     totalRated = savedRatings.length;
     updateStats();
     renderLeaderboards();
@@ -1732,7 +1871,7 @@ async function initApp() {
             }));
           }
           consolidateDuplicateArtistKeys();
-          fixRound1Elimination();
+          reconcileEliminationFromRatings();
           purgeQueueIneligible();
           if (songQueue.length === 0) buildQueue();
           updateStats();
@@ -1797,13 +1936,14 @@ function loadCacheIntoState(cacheData, source) {
   for (const name of COACHELLA_ARTISTS) {
     const c = cacheData[name];
     if (!c || !c.tracks || !c.tracks.length) { loaded++; continue; }
-    const existing = artists[name] || { ratings: [], playedTrackIds: [], eliminated: false, avgRating: 0 };
+    const existing = artists[name] || { ratings: [], playedTrackIds: [], eliminated: false, round2LockedFinal: false, avgRating: 0 };
     artists[name] = {
       spotifyId: c.spotifyId,
       tracks: c.tracks,
       ratings: existing.ratings,
       playedTrackIds: Array.isArray(existing.playedTrackIds) ? existing.playedTrackIds : [],
       eliminated: existing.eliminated,
+      round2LockedFinal: !!existing.round2LockedFinal,
       avgRating: existing.avgRating
     };
     if (!artistInShuffle(name)) { loaded++; continue; }
@@ -1817,7 +1957,7 @@ function loadCacheIntoState(cacheData, source) {
       ((loaded / COACHELLA_ARTISTS.length) * 100) + '%';
   }
   consolidateDuplicateArtistKeys();
-  fixRound1Elimination(); // after merging cache, pull back anyone eliminated with < 3 ratings
+  reconcileEliminationFromRatings();
   purgeQueueIneligible(); // drop queued songs for artists already done with round 1 (or round 2 done)
   console.log(`Loaded ${loaded} artists from ${source}`);
   return loaded;
@@ -1992,13 +2132,14 @@ async function loadArtistTracksInBackground() {
 
       trackData[name] = { spotifyId: spotId, tracks };
 
-      const existing = artists[name] || { ratings: [], playedTrackIds: [], eliminated: false, avgRating: 0 };
+      const existing = artists[name] || { ratings: [], playedTrackIds: [], eliminated: false, round2LockedFinal: false, avgRating: 0 };
       artists[name] = {
         spotifyId: spotId,
         tracks,
         ratings: existing.ratings,
         playedTrackIds: Array.isArray(existing.playedTrackIds) ? existing.playedTrackIds : [],
         eliminated: existing.eliminated,
+        round2LockedFinal: !!existing.round2LockedFinal,
         avgRating: existing.avgRating
       };
 
@@ -2041,6 +2182,7 @@ async function loadArtistTracksInBackground() {
   }
 
   consolidateDuplicateArtistKeys();
+  reconcileEliminationFromRatings();
 
   if (isUsableTrackCache(trackData)) {
     saveTrackCache(trackData);
@@ -2254,8 +2396,10 @@ async function playNext() {
     if (songQueue.length === 0) {
       buildQueue();
       if (songQueue.length === 0) {
-        if (isRound2()) {
-          showToast('Round 2 complete! All songs from your IN artists have been played.');
+        if (isFinalPlaylistPhase()) {
+          showToast('All shuffled tracks from your finalists have been played for now.');
+        } else if (isRound2Phase()) {
+          showToast('Round 2: queue empty — other artists may still need ratings, or all IN tracks are exhausted.');
         } else {
           showToast('All songs have been played! Check your results.');
         }
@@ -2296,8 +2440,10 @@ async function playNext() {
       currentSong = pickNextEligibleFromQueue();
     }
     if (!currentSong) {
-      if (isRound2()) {
-        showToast('Round 2 complete! All songs from your IN artists have been played.');
+      if (isFinalPlaylistPhase()) {
+        showToast('All shuffled tracks from your finalists have been played for now.');
+      } else if (isRound2Phase()) {
+        showToast('Round 2: queue empty — other artists may still need ratings, or all IN tracks are exhausted.');
       } else {
         showToast('All songs have been played! Check your results.');
       }
@@ -2445,20 +2591,28 @@ function rate(score) {
     fbSaveRating(userId, lineupKeyForStoredArtistName(artistName), ratingObj.trackId, ratingObj.trackName, score);
   }
 
-  // Recalculate average
-  const sum = artistData.ratings.reduce((a, r) => a + (typeof r === 'number' ? r : r.score), 0);
-  artistData.avgRating = sum / artistData.ratings.length;
+  const nk = artistNormKey(artistName);
+  const uAvg = avgRatingForNorm(nk);
+  forEachArtistRowMatchingNorm(nk, (a) => { a.avgRating = uAvg; });
+
+  const rlen = unionRatingsCountForNorm(nk);
+  const disp = lineupKeyForStoredArtistName(artistName);
 
   totalRated++;
 
-  // Eliminate only after 3 songs in round 1, or in round 2 if avg drops below 3
-  if (!artistData.eliminated && artistData.ratings.length >= MIN_RATINGS && artistData.avgRating < ELIMINATION_THRESHOLD) {
-    artistData.eliminated = true;
-    showToast(`❌ ${artistName} eliminated (avg: ${artistData.avgRating.toFixed(1)})`, 'eliminated-toast');
-  } else if (!artistData.eliminated && artistData.ratings.length === MIN_RATINGS) {
-    showToast(`✅ ${artistName} survives! (avg: ${artistData.avgRating.toFixed(1)}) → Round 2`, 'kept-toast');
-  } else if (!artistData.eliminated && artistData.ratings.length === FINAL_LINEUP_RATINGS) {
-    showToast(`🏁 ${artistName} is in your final lineup! (avg: ${artistData.avgRating.toFixed(1)})`, 'kept-toast');
+  if (rlen === ROUND2_TOTAL_TARGET) {
+    if (uAvg < ROUND2_MIN_AVG) {
+      setEliminatedAcrossNorm(nk, true);
+      showToast(`❌ ${disp} eliminated after Round 2 (avg: ${uAvg.toFixed(1)})`, 'eliminated-toast');
+    } else {
+      forEachArtistRowMatchingNorm(nk, (a) => { a.round2LockedFinal = true; });
+      showToast(`🏁 ${disp} is in your final playlist! (avg: ${uAvg.toFixed(1)})`, 'kept-toast');
+    }
+  } else if (rlen === ROUND1_TARGET && uAvg < ROUND1_MIN_AVG) {
+    setEliminatedAcrossNorm(nk, true);
+    showToast(`❌ ${disp} eliminated (avg: ${uAvg.toFixed(1)})`, 'eliminated-toast');
+  } else if (rlen === ROUND1_TARGET && uAvg >= ROUND1_MIN_AVG) {
+    showToast(`✅ ${disp} survives Round 1! (avg: ${uAvg.toFixed(1)})`, 'kept-toast');
   }
 
   updateStats();
@@ -2469,8 +2623,7 @@ function rate(score) {
   // Purge queue so artists with 3+ plays (round 1 done) don't appear until round 2
   purgeQueueIneligible();
 
-  // Auto-advance: sooner when artist just hit 3 (round 1 done) so we don't linger on that screen
-  const delayMs = (!artistData.eliminated && artistData.ratings.length === MIN_RATINGS) ? 400 : 800;
+  const delayMs = (!anyEliminatedForNorm(nk) && (rlen === ROUND1_TARGET || rlen === ROUND2_TOTAL_TARGET)) ? 400 : 800;
   if (window._ratingAdvanceTimeout) clearTimeout(window._ratingAdvanceTimeout);
   window._ratingAdvanceTimeout = setTimeout(() => {
     window._ratingAdvanceTimeout = null;
@@ -2492,28 +2645,62 @@ function skipSong() {
 // ═══════════════════════════════════════════
 function updateStats() {
   fixRound1Elimination(); // ensure no one is eliminated with < 3 ratings
-  const isEliminated = (a) => a.eliminated && ratingCount(a) >= MIN_RATINGS;
-  const active = Object.values(artists).filter(a => !isEliminated(a)).length;
-  const eliminated = Object.values(artists).filter(isEliminated).length;
+  const seenNk = new Set();
+  let active = 0;
+  let eliminated = 0;
+  for (const name of Object.keys(artists)) {
+    const nk = artistNormKey(name);
+    if (seenNk.has(nk)) continue;
+    seenNk.add(nk);
+    const out = anyEliminatedForNorm(nk) && unionRatingsCountForNorm(nk) >= MIN_RATINGS;
+    if (out) eliminated++;
+    else active++;
+  }
 
   document.getElementById('stat-remaining').textContent = active;
   document.getElementById('stat-eliminated').textContent = eliminated;
   document.getElementById('stat-rated').textContent = totalRated;
 
-  // Progress: artists either eliminated (with 3+ ratings) or in final lineup (8 plays)
-  const total = Object.keys(artists).length;
-  const evaluated = Object.values(artists).filter(a => isEliminated(a) || ratingCount(a) >= FINAL_LINEUP_RATINGS).length;
-  const pct = total > 0 ? (evaluated / total * 100) : 0;
+  const phaseValEl = document.getElementById('stat-phase-value');
+  if (phaseValEl) {
+    let hasAnyCatalog = false;
+    for (const lineupName of COACHELLA_ARTISTS) {
+      if (hasTracksForNorm(artistNormKey(lineupName))) {
+        hasAnyCatalog = true;
+        break;
+      }
+    }
+    if (!hasAnyCatalog) {
+      phaseValEl.textContent = 'Loading artists…';
+    } else if (isFinalPlaylistPhase()) {
+      phaseValEl.textContent = 'Final playlist';
+    } else if (isRound2Phase()) {
+      phaseValEl.textContent = 'Round 2';
+    } else {
+      phaseValEl.textContent = 'Round 1';
+    }
+  }
+
+  let done = 0;
+  let lineupWithTracks = 0;
+  for (const lineupName of COACHELLA_ARTISTS) {
+    const nk = artistNormKey(lineupName);
+    if (!hasTracksForNorm(nk)) continue;
+    lineupWithTracks++;
+    if (lineupActFullyResolved(nk)) done++;
+  }
+  const pct = lineupWithTracks > 0 ? (done / lineupWithTracks * 100) : 0;
   document.getElementById('progress-fill').style.width = pct + '%';
 }
 
 function renderLeaderboards() {
   fixRound1Elimination(); // ensure eliminated list is correct before painting
-  // Only show as eliminated if they have 3+ ratings (round 1 rule)
-  const canBeEliminated = ([_, a]) => a.eliminated && ratingCount(a) >= MIN_RATINGS;
-  // Active: not eliminated, or eliminated but < 3 ratings (still in round 1)
+  const canBeEliminated = ([name]) => {
+    const nk = artistNormKey(name);
+    return anyEliminatedForNorm(nk) && unionRatingsCountForNorm(nk) >= MIN_RATINGS;
+  };
   const activeArtists = Object.entries(artists)
-    .filter(([_, a]) => !canBeEliminated([_, a]))
+    .filter(([name]) => !canBeEliminated([name]))
     .sort((a, b) => b[1].avgRating - a[1].avgRating || b[1].ratings.length - a[1].ratings.length);
 
   const eliminatedArtists = Object.entries(artists)
@@ -2524,34 +2711,46 @@ function renderLeaderboards() {
     .sort((a, b) => b[1].avgRating - a[1].avgRating || b[1].ratings.length - a[1].ratings.length);
 
   document.getElementById('leaderboard-active').innerHTML = activeArtists.map(([name, data], i) =>
-    renderRow(name, data, i + 1, false)
+    renderRow(name, data, i + 1)
   ).join('');
 
   document.getElementById('leaderboard-eliminated').innerHTML = eliminatedArtists.length > 0
-    ? eliminatedArtists.map(([name, data], i) => renderRow(name, data, i + 1, true)).join('')
+    ? eliminatedArtists.map(([name, data], i) => renderRow(name, data, i + 1)).join('')
     : '<div style="text-align:center;color:rgba(255,255,255,0.3);padding:30px;">No artists eliminated yet</div>';
 
   document.getElementById('leaderboard-all').innerHTML = allArtists.map(([name, data], i) =>
-    renderRow(name, data, i + 1, canBeEliminated([name, data]))
+    renderRow(name, data, i + 1)
   ).join('');
 }
 
-function renderRow(name, data, rank, isEliminated) {
-  const statusClass = isEliminated ? 'eliminated' :
-    data.ratings.length >= FINAL_LINEUP_RATINGS ? 'kept' :
-    data.ratings.length >= MIN_RATINGS ? 'kept' : 'pending';
-  const statusText = isEliminated ? 'OUT' :
-    data.ratings.length >= FINAL_LINEUP_RATINGS ? 'Final' :
-    data.ratings.length >= MIN_RATINGS ? `IN (${data.ratings.length}/${FINAL_LINEUP_RATINGS})` : `${data.ratings.length}/${MIN_RATINGS}`;
+function renderRow(name, data, rank) {
+  const nk = artistNormKey(name);
+  const uCount = unionRatingsCountForNorm(nk);
+  const normElim = anyEliminatedForNorm(nk);
+  const finalist = isNormFinalist(nk);
+  const showOut = normElim && uCount >= MIN_RATINGS;
+
+  const statusClass = showOut ? 'eliminated' :
+    finalist ? 'kept' :
+    (isRound2Phase() && survivedRound1Norm(nk) && uCount < ROUND2_TOTAL_TARGET) ? 'kept' :
+    (uCount >= ROUND1_TARGET && !globalRound1Complete() && !normElim) ? 'kept' :
+    uCount > 0 ? 'kept' : 'pending';
+
+  let statusText;
+  if (showOut) statusText = 'OUT';
+  else if (finalist) statusText = 'Final';
+  else if (isRound2Phase() && survivedRound1Norm(nk)) statusText = `IN (${uCount}/${ROUND2_TOTAL_TARGET})`;
+  else if (uCount >= ROUND1_TARGET && !globalRound1Complete() && !normElim) statusText = 'R1 ✓';
+  else statusText = `${uCount}/${ROUND1_TARGET}`;
 
   return `
-    <div class="lb-row ${isEliminated ? 'eliminated' : ''}">
+    <div class="lb-row ${showOut ? 'eliminated' : ''}">
       <div class="lb-rank">${rank}</div>
       <div class="lb-info">
         <div class="lb-name">${name}</div>
-        <div class="lb-meta">${data.ratings.length} rated · ${data.tracks.length} tracks available</div>
+        <div class="lb-meta">${uCount} rated · ${data.tracks.length} tracks available</div>
       </div>
-      <div class="lb-avg">${data.ratings.length > 0 ? data.avgRating.toFixed(1) : '—'}</div>
+      <div class="lb-avg">${uCount > 0 ? avgRatingForNorm(nk).toFixed(1) : '—'}</div>
       <div class="lb-status ${statusClass}">${statusText}</div>
     </div>
   `;
@@ -2710,11 +2909,8 @@ async function showUserDetail(spotifyId) {
 }
 
 function checkFinishEligibility() {
-  const total = Object.keys(artists).length;
-  // Finish when every artist is either eliminated or has 8 plays (in final lineup)
-  const evaluated = Object.values(artists).filter(a => a.eliminated || a.ratings.length >= FINAL_LINEUP_RATINGS).length;
   const btn = document.getElementById('btn-finish');
-  btn.disabled = evaluated < total;
+  btn.disabled = !allLineupActsResolved();
 }
 
 // ═══════════════════════════════════════════
@@ -2724,29 +2920,47 @@ async function finishSession() {
   // Pause playback
   await spotifyFetch('/me/player/pause', { method: 'PUT' }).catch(() => {});
 
-  // Final lineup: not eliminated and have 8 plays, ranked by average
-  const finalLineup = Object.entries(artists)
-    .filter(([_, a]) => !a.eliminated && a.ratings.length >= FINAL_LINEUP_RATINGS)
-    .sort((a, b) => b[1].avgRating - a[1].avgRating);
+  const finalLineup = COACHELLA_ARTISTS
+    .filter(ln => isNormFinalist(artistNormKey(ln)))
+    .map(ln => {
+      const st = getArtistState(ln);
+      return st ? [ln, st] : null;
+    })
+    .filter(Boolean)
+    .sort((a, b) => avgRatingForNorm(artistNormKey(b[0])) - avgRatingForNorm(artistNormKey(a[0])));
 
-  const eliminated = Object.entries(artists).filter(([_, a]) => a.eliminated);
+  let elimLineupActs = 0;
+  const elimSeen = new Set();
+  for (const ln of COACHELLA_ARTISTS) {
+    const nk = artistNormKey(ln);
+    if (!hasTracksForNorm(nk)) continue;
+    if (anyEliminatedForNorm(nk) && unionRatingsCountForNorm(nk) >= MIN_RATINGS && !elimSeen.has(nk)) {
+      elimSeen.add(nk);
+      elimLineupActs++;
+    }
+  }
 
   document.getElementById('player-section').style.display = 'none';
   document.getElementById('results-screen').style.display = 'block';
 
   document.getElementById('results-summary').textContent =
-    `${finalLineup.length} artists in your final lineup (of ${Object.keys(artists).length}). ${eliminated.length} eliminated.`;
+    `${finalLineup.length} artists in your final playlist. ${elimLineupActs} lineup acts eliminated.`;
 
   document.getElementById('results-leaderboard').innerHTML =
-    finalLineup.map(([name, data], i) => renderRow(name, data, i + 1, false)).join('');
+    finalLineup.map(([name, data], i) => renderRow(name, data, i + 1)).join('');
 }
 
 async function createPlaylist() {
   showLoading('Creating your Coachella playlist...');
 
-  const finalLineup = Object.entries(artists)
-    .filter(([_, a]) => !a.eliminated && a.ratings.length >= FINAL_LINEUP_RATINGS)
-    .sort((a, b) => b[1].avgRating - a[1].avgRating);
+  const finalLineup = COACHELLA_ARTISTS
+    .filter(ln => isNormFinalist(artistNormKey(ln)))
+    .map(ln => {
+      const st = getArtistState(ln);
+      return st ? [ln, st] : null;
+    })
+    .filter(Boolean)
+    .sort((a, b) => avgRatingForNorm(artistNormKey(b[0])) - avgRatingForNorm(artistNormKey(a[0])));
 
   // Create playlist
   const playlist = await spotifyFetch('/me/playlists', {
@@ -2828,6 +3042,7 @@ async function restartSession() {
           ratings: mapped,
           playedTrackIds: [],
           eliminated: false,
+          round2LockedFinal: false,
           avgRating: Math.round(avg * 10) / 10
         };
       }
@@ -2835,6 +3050,7 @@ async function restartSession() {
     }
   }
   consolidateDuplicateArtistKeys();
+  reconcileEliminationFromRatings();
   document.getElementById('results-screen').style.display = 'none';
   document.getElementById('player-section').style.display = 'block';
   loadArtistTracksInBackground();
